@@ -1,0 +1,10 @@
+primary:
+  persistence:
+    size: {{ .Values.superset.postgres.storage }}
+  resources:
+    requests:
+      cpu: {{ .Values.superset.postgres.resources.requests.cpu | quote }}
+      memory: {{ .Values.superset.postgres.resources.requests.memory | quote }}
+    limits:
+      cpu: {{ .Values.superset.postgres.resources.limits.cpu | quote }}
+      memory: {{ .Values.superset.postgres.resources.limits.memory | quote }}

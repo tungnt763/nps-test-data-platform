@@ -1,0 +1,38 @@
+server:
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+      listener "tcp" {
+        tls_disable = 1
+        address = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+      storage "raft" {
+        path = "/vault/data"
+        node_id = "vault-0"
+      }
+      service_registration "kubernetes" {}
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  dataStorage:
+    enabled: true
+    size: 10Gi
+
+ui:
+  enabled: true
+  serviceType: "ClusterIP"
+
+injector:
+  enabled: true
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"

@@ -1,0 +1,11 @@
+resources:
+  requests:
+    cpu: {{ .Values.ranger.resources.requests.cpu | quote }}
+    memory: {{ .Values.ranger.resources.requests.memory | quote }}
+  limits:
+    cpu: {{ .Values.ranger.resources.limits.cpu | quote }}
+    memory: {{ .Values.ranger.resources.limits.memory | quote }}
+
+audit:
+  solr:
+    enabled: {{ .Values.ranger.audit.solr }}

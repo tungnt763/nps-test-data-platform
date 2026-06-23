@@ -1,0 +1,138 @@
+repositories:
+  - name: hashicorp
+    url: https://helm.releases.hashicorp.com
+  - name: minio
+    url: https://charts.min.io/
+  - name: bitnami
+    url: https://charts.bitnami.com/bitnami
+  - name: dysnix
+    url: https://dysnix.github.io/charts
+  - name: superset
+    url: https://apache.github.io/superset
+
+environments:
+  dev:
+    values:
+      - environments/dev.yaml
+  uat:
+    values:
+      - environments/uat.yaml
+  prod:
+    values:
+      - environments/prod.yaml
+
+---
+
+releases:
+  # ─────────────────────────────────────────────
+  # LAYER 01 — data-security: HashiCorp Vault
+  # ─────────────────────────────────────────────
+  - name: vault
+    namespace: data-security
+    chart: hashicorp/vault
+    version: "0.28.1"
+    values:
+      - values/base/vault.yaml
+      - values/env/vault.yaml.gotmpl
+    labels:
+      layer: 01-security
+
+  # ─────────────────────────────────────────────
+  # LAYER 02 — data-storage: MinIO
+  # ─────────────────────────────────────────────
+  - name: minio
+    namespace: data-storage
+    chart: minio/minio
+    version: "5.2.0"
+    values:
+      - values/base/minio.yaml
+      - values/env/minio.yaml.gotmpl
+    labels:
+      layer: 02-storage
+
+  # ─────────────────────────────────────────────
+  # LAYER 03 — data-ingestion: Apache NiFi
+  # ─────────────────────────────────────────────
+  - name: nifi
+    namespace: data-ingestion
+    chart: ./charts/nifi
+    values:
+      - values/base/nifi.yaml
+      - values/env/nifi.yaml.gotmpl
+    needs:
+      - data-security/vault
+      - data-storage/minio
+    labels:
+      layer: 03-ingestion
+
+  # ─────────────────────────────────────────────
+  # LAYER 04 — data-governance: Ranger + PostgreSQL
+  # ─────────────────────────────────────────────
+  - name: postgres-ranger
+    namespace: data-governance
+    chart: bitnami/postgresql
+    version: "18.7.6"
+    values:
+      - values/base/ranger-postgres.yaml
+      - values/env/ranger-postgres.yaml.gotmpl
+    labels:
+      layer: 04-governance
+      component: postgres
+
+  - name: ranger
+    namespace: data-governance
+    chart: ./charts/ranger
+    values:
+      - values/base/ranger.yaml
+      - values/env/ranger.yaml.gotmpl
+    needs:
+      - data-governance/postgres-ranger
+      - data-security/vault
+    labels:
+      layer: 04-governance
+      component: ranger
+
+  # ─────────────────────────────────────────────
+  # LAYER 05 — data-processing: Dremio
+  # ─────────────────────────────────────────────
+  - name: dremio
+    namespace: data-processing
+    chart: ./charts/dremio
+    values:
+      - values/base/dremio.yaml
+      - values/env/dremio.yaml.gotmpl
+    needs:
+      - data-storage/minio
+      - data-governance/ranger
+      - data-security/vault
+    labels:
+      layer: 05-processing
+
+  # ─────────────────────────────────────────────
+  # LAYER 06 — data-visualization: Superset
+  # ─────────────────────────────────────────────
+  - name: postgres-superset
+    namespace: data-visualization
+    chart: bitnami/postgresql
+    version: "18.7.6"
+    values:
+      - values/base/superset-postgres.yaml
+      - values/env/superset-postgres.yaml.gotmpl
+    labels:
+      layer: 06-visualization
+      component: postgres
+
+  - name: superset
+    namespace: data-visualization
+    chart: superset/superset
+    version: "0.12.9"
+    values:
+      - values/base/superset.yaml
+      - values/env/superset.yaml.gotmpl
+    needs:
+      - data-visualization/postgres-superset
+      - data-processing/dremio
+      - data-security/vault
+    labels:
+      layer: 06-visualization
+      component: superset

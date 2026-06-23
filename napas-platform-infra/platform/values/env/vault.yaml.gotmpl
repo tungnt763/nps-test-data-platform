@@ -1,0 +1,10 @@
+server:
+  dataStorage:
+    size: {{ .Values.vault.storage }}
+  resources:
+    requests:
+      cpu: {{ .Values.vault.resources.requests.cpu | quote }}
+      memory: {{ .Values.vault.resources.requests.memory | quote }}
+    limits:
+      cpu: {{ .Values.vault.resources.limits.cpu | quote }}
+      memory: {{ .Values.vault.resources.limits.memory | quote }}

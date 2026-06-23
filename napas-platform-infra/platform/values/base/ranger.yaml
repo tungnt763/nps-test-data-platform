@@ -1,0 +1,37 @@
+image:
+  repository: apache/ranger
+  tag: "2.4.0"
+  pullPolicy: IfNotPresent
+
+admin:
+  port: 6080
+  password: "RangerAdmin@2024"
+
+database:
+  host: "postgres-ranger-postgresql.data-governance.svc.cluster.local"
+  port: 5432
+  dbName: ranger
+  username: ranger
+  password: "Ranger@Postgres2024"
+
+audit:
+  solr:
+    enabled: false
+  log4j:
+    enabled: true
+
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2000m"
+
+service:
+  type: ClusterIP
+  port: 6080
+
+persistence:
+  enabled: true
+  size: 5Gi

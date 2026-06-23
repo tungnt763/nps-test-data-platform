@@ -1,0 +1,60 @@
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: napas-platform
+
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # MinIO Console
+      - containerPort: 30901
+        hostPort: 9001
+        protocol: TCP
+      # NiFi HTTPS
+      - containerPort: 30443
+        hostPort: 8443
+        protocol: TCP
+      # Vault
+      - containerPort: 30820
+        hostPort: 8200
+        protocol: TCP
+      # Ranger Admin
+      - containerPort: 30608
+        hostPort: 6080
+        protocol: TCP
+      # Dremio UI
+      - containerPort: 30904
+        hostPort: 9047
+        protocol: TCP
+      # Superset
+      - containerPort: 30808
+        hostPort: 8088
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+
+  # Worker 1: Heavy services (NiFi, Dremio Coordinator)
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/napas-platform/worker1
+        containerPath: /data
+        readOnly: false
+    labels:
+      workload: heavy
+
+  # Worker 2: Storage + Light services (MinIO, Vault, Ranger)
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/napas-platform/worker2
+        containerPath: /data
+        readOnly: false
+    labels:
+      workload: storage
+
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  disableDefaultCNI: false

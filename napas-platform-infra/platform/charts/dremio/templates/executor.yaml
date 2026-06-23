@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-executor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: dremio
+    role: executor
+spec:
+  replicas: {{ .Values.executor.count }}
+  serviceName: {{ .Release.Name }}-executor
+  selector:
+    matchLabels:
+      app: dremio
+      role: executor
+  template:
+    metadata:
+      labels:
+        app: dremio
+        role: executor
+    spec:
+      initContainers:
+        - name: setup-config
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              cat > /opt/dremio/conf/dremio.conf <<'DREMIOCONF'
+              paths: {
+                local: "/opt/dremio/data"
+                dist: "pdfs:///opt/dremio/data/pdfs"
+              }
+              services: {
+                coordinator.enabled: false,
+                coordinator.master.enabled: false,
+                executor.enabled: true
+              }
+              zookeeper: "{{ .Release.Name }}-coordinator-0.{{ .Release.Name }}-coordinator.{{ .Release.Namespace }}.svc.cluster.local:2181"
+              DREMIOCONF
+              cat > /opt/dremio/conf/core-site.xml <<'CORESITE'
+              <?xml version="1.0"?>
+              <configuration>
+                <property>
+                  <name>fs.s3a.endpoint</name>
+                  <value>{{ .Values.distStorage.aws.endpoint }}</value>
+                </property>
+                <property>
+                  <name>fs.s3a.access.key</name>
+                  <value>{{ .Values.distStorage.aws.credentials.accessKey }}</value>
+                </property>
+                <property>
+                  <name>fs.s3a.secret.key</name>
+                  <value>{{ .Values.distStorage.aws.credentials.secret }}</value>
+                </property>
+                <property>
+                  <name>fs.s3a.path.style.access</name>
+                  <value>true</value>
+                </property>
+                <property>
+                  <name>fs.s3a.connection.ssl.enabled</name>
+                  <value>false</value>
+                </property>
+              </configuration>
+              CORESITE
+          volumeMounts:
+            - name: dremio-config
+              mountPath: /opt/dremio/conf
+      containers:
+        - name: dremio-executor
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 45678
+              name: inter-node
+          env:
+            - name: DREMIO_MAX_HEAP_MEMORY_SIZE_MB
+              value: "2048"
+            - name: DREMIO_MAX_DIRECT_MEMORY_SIZE_MB
+              value: "2048"
+          resources:
+            requests:
+              cpu: {{ .Values.executor.cpu | quote }}
+              memory: "5120Mi"
+            limits:
+              cpu: {{ .Values.executor.cpu | quote }}
+              memory: "5120Mi"
+          volumeMounts:
+            - name: dremio-data
+              mountPath: /opt/dremio/data
+            - name: dremio-config
+              mountPath: /opt/dremio/conf
+      volumes:
+        - name: dremio-config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: dremio-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.executor.volumeSize }}

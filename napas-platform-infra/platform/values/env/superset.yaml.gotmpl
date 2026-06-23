@@ -1,0 +1,7 @@
+resources:
+  requests:
+    cpu: {{ .Values.superset.resources.requests.cpu | quote }}
+    memory: {{ .Values.superset.resources.requests.memory | quote }}
+  limits:
+    cpu: {{ .Values.superset.resources.limits.cpu | quote }}
+    memory: {{ .Values.superset.resources.limits.memory | quote }}

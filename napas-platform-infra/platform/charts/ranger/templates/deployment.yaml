@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: ranger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ranger
+  template:
+    metadata:
+      labels:
+        app: ranger
+    spec:
+      containers:
+        - name: ranger-admin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.admin.port }}
+              name: http
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              cd /opt/ranger/admin
+              PROPS=install.properties
+              sed -i "s|^db_host=.*|db_host={{ .Values.database.host }}|" $PROPS
+              sed -i "s|^db_name=.*|db_name={{ .Values.database.dbName }}|" $PROPS
+              sed -i "s|^db_user=.*|db_user={{ .Values.database.username }}|" $PROPS
+              sed -i "s|^db_password=.*|db_password={{ .Values.database.password }}|" $PROPS
+              sed -i "s|^db_root_user=.*|db_root_user={{ .Values.database.username }}|" $PROPS
+              sed -i "s|^db_root_password=.*|db_root_password={{ .Values.database.password }}|" $PROPS
+              sed -i "s|^rangerAdmin_password=.*|rangerAdmin_password={{ .Values.admin.password }}|" $PROPS
+              sed -i "s|^audit_solr_enabled=.*|audit_solr_enabled=false|" $PROPS
+              echo "=== DB Config ==="
+              grep "^db_" $PROPS
+              echo "================="
+              ./setup.sh
+              /opt/ranger/admin/ews/ranger-admin-services.sh start
+              tail -f /opt/ranger/admin/ews/logs/*.log 2>/dev/null || tail -f /dev/null
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | quote }}
+              memory: {{ .Values.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+              memory: {{ .Values.resources.limits.memory | quote }}
+          startupProbe:
+            httpGet:
+              path: /login.jsp
+              port: {{ .Values.admin.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /login.jsp
+              port: {{ .Values.admin.port }}
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /login.jsp
+              port: {{ .Values.admin.port }}
+            periodSeconds: 30
+            failureThreshold: 3

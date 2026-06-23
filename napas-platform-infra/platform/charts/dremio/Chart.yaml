@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dremio
+description: Dremio Data Lake Engine
+type: application
+version: 0.1.0
+appVersion: "24.3.2"

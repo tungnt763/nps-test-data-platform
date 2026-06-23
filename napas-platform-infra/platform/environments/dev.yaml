@@ -1,0 +1,103 @@
+# ═══════════════════════════════════════════════════════════
+# NAPAS DATA PLATFORM — DEV ENVIRONMENT CONFIGURATION
+# Single Source of Truth cho môi trường development (Kind cluster)
+# ═══════════════════════════════════════════════════════════
+
+global:
+  env: dev
+  domain: napas-platform.local
+  cluster: kind-napas-platform
+  ingress:
+    enabled: false    # Dùng kubectl port-forward cho local dev
+
+# ─────────────────────────────────────
+# HashiCorp Vault
+# ─────────────────────────────────────
+vault:
+  storage: 10Gi
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+# ─────────────────────────────────────
+# MinIO
+# ─────────────────────────────────────
+minio:
+  mode: standalone
+  storage: 20Gi
+  serviceType: ClusterIP
+  auth:
+    rootUser: napas-admin
+    rootPassword: "napas-minio-s3cr3t-2024"
+    useExistingSecret: false
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits:   { cpu: "1",    memory: "2Gi"   }
+
+# ─────────────────────────────────────
+# Apache NiFi
+# ─────────────────────────────────────
+nifi:
+  replicaCount: 1
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { cpu: "2",    memory: "4Gi" }
+  persistence:
+    flowRepo:       5Gi
+    contentRepo:   20Gi
+    provenanceRepo: 10Gi
+
+# ─────────────────────────────────────
+# Apache Ranger (+ PostgreSQL)
+# ─────────────────────────────────────
+ranger:
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { cpu: "2",    memory: "4Gi" }
+  audit:
+    solr: false    # Tắt Solr audit cho dev, dùng log file
+  postgres:
+    storage: 10Gi
+    resources:
+      requests: { cpu: "250m", memory: "256Mi" }
+      limits:   { cpu: "500m", memory: "512Mi" }
+
+# ─────────────────────────────────────
+# Dremio
+# ─────────────────────────────────────
+dremio:
+  coordinator:
+    count: 1
+    memory: 4096    # MB (giảm cho dev)
+    cpu: 2
+    storage: 30Gi
+  executor:
+    count: 1
+    memory: 4096    # MB
+    cpu: 2
+    storage: 20Gi
+  minio:
+    # Dremio kết nối MinIO
+    endpoint: "http://minio.data-storage.svc.cluster.local:9000"
+    bucket: "napas-datalake"
+    accessKey: "napas-admin"
+    secretKey: "napas-minio-s3cr3t-2024"
+
+# ─────────────────────────────────────
+# Apache Superset (+ PostgreSQL + Redis)
+# ─────────────────────────────────────
+superset:
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { cpu: "1",    memory: "2Gi" }
+  postgres:
+    storage: 10Gi
+    resources:
+      requests: { cpu: "250m", memory: "256Mi" }
+      limits:   { cpu: "500m", memory: "512Mi" }
+  redis:
+    storage: 5Gi
+  dremio:
+    host: "dremio.data-processing.svc.cluster.local"
+    port: 32010
+    useEncryption: false

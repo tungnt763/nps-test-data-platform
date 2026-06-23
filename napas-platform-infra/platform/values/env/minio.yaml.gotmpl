@@ -1,0 +1,18 @@
+mode: {{ .Values.minio.mode }}
+
+persistence:
+  size: {{ .Values.minio.storage }}
+
+service:
+  type: {{ .Values.minio.serviceType }}
+
+rootUser: {{ .Values.minio.auth.rootUser }}
+rootPassword: {{ .Values.minio.auth.rootPassword }}
+
+resources:
+  requests:
+    cpu: {{ .Values.minio.resources.requests.cpu | quote }}
+    memory: {{ .Values.minio.resources.requests.memory | quote }}
+  limits:
+    cpu: {{ .Values.minio.resources.limits.cpu | quote }}
+    memory: {{ .Values.minio.resources.limits.memory | quote }}

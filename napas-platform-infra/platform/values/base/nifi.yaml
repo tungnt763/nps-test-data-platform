@@ -1,0 +1,38 @@
+image:
+  repository: apache/nifi
+  tag: "1.25.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+properties:
+  sensitiveKey: "NAPaSSensitiveKey2024MinLength12"
+  isNode: true
+  webProxyHost: ""
+
+auth:
+  singleUser:
+    username: admin
+    password: "NiFiAdmin@2024"
+
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2000m"
+
+persistence:
+  enabled: true
+
+service:
+  type: ClusterIP
+
+env:
+  - name: NIFI_WEB_HTTPS_PORT
+    value: "8443"
+  - name: NIFI_JVM_HEAP_INIT
+    value: "1g"
+  - name: NIFI_JVM_HEAP_MAX
+    value: "2g"

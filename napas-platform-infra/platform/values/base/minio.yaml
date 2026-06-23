@@ -1,0 +1,30 @@
+mode: standalone
+
+rootUser: "napas-admin"
+rootPassword: "napas-minio-s3cr3t-2024"
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "250m"
+  limits:
+    memory: "2Gi"
+    cpu: "1000m"
+
+persistence:
+  enabled: true
+  size: 20Gi
+
+service:
+  type: ClusterIP
+
+consoleService:
+  type: ClusterIP
+
+buckets:
+  - name: napas-datalake
+    policy: none
+    purge: false
+
+environment:
+  MINIO_BROWSER_REDIRECT_URL: ""

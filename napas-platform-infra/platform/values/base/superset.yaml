@@ -1,0 +1,69 @@
+image:
+  repository: apache/superset
+  tag: "4.0.1"
+  pullPolicy: IfNotPresent
+
+configOverrides:
+  secret: |
+    SECRET_KEY = 'NAPASSupersetSecretKey2024ChangeMe'
+
+init:
+  adminUser:
+    username: admin
+    password: "NapasSuperset@2024"
+    email: admin@napas.com
+    firstname: Admin
+    lastname: Napas
+
+resources:
+  requests:
+    memory: "1Gi"
+    cpu: "500m"
+  limits:
+    memory: "2Gi"
+    cpu: "1000m"
+
+supersetWorker:
+  enabled: true
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "500m"
+
+# Disable bundled PostgreSQL — ta dùng postgres-superset riêng
+postgresql:
+  enabled: false
+
+# Override DB connection cho init containers
+supersetNode:
+  connections:
+    db_host: "postgres-superset-postgresql.data-visualization.svc.cluster.local"
+    db_port: "5432"
+    db_user: "superset"
+    db_pass: "SupersetPostgres2024"
+    db_name: "superset"
+    redis_host: "superset-redis-master.data-visualization.svc.cluster.local"
+    redis_port: "6379"
+
+# Redis — fix image tag
+redis:
+  enabled: true
+  auth:
+    enabled: false
+  image:
+    tag: "latest"
+  master:
+    persistence:
+      enabled: true
+      size: 5Gi
+
+service:
+  type: ClusterIP
+  port: 8088
+
+extraEnvRaw:
+  - name: SUPERSET_DATABASE_URI
+    value: "postgresql://superset:Superset%40Postgres2024@postgres-superset-postgresql.data-visualization.svc.cluster.local:5432/superset"

@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: nifi
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ .Release.Name }}
+  selector:
+    matchLabels:
+      app: nifi
+  template:
+    metadata:
+      labels:
+        app: nifi
+    spec:
+      containers:
+        - name: nifi
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8443
+              name: https
+          env:
+            - name: NIFI_WEB_HTTPS_HOST
+              value: "0.0.0.0"
+            - name: NIFI_WEB_HTTPS_PORT
+              value: "8443"
+            - name: NIFI_WEB_PROXY_HOST
+              value: "localhost:8443"
+            - name: SINGLE_USER_CREDENTIALS_USERNAME
+              value: {{ .Values.auth.singleUser.username | quote }}
+            - name: SINGLE_USER_CREDENTIALS_PASSWORD
+              value: {{ .Values.auth.singleUser.password | quote }}
+            - name: NIFI_SENSITIVE_PROPS_KEY
+              value: {{ .Values.sensitivePropsKey | quote }}
+            - name: NIFI_JVM_HEAP_INIT
+              value: {{ .Values.jvm.heapInit | quote }}
+            - name: NIFI_JVM_HEAP_MAX
+              value: {{ .Values.jvm.heapMax | quote }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | quote }}
+              memory: {{ .Values.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+              memory: {{ .Values.resources.limits.memory | quote }}
+          volumeMounts:
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/flowfile_repository
+              subPath: flowfile_repository
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/content_repository
+              subPath: content_repository
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/provenance_repository
+              subPath: provenance_repository
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/database_repository
+              subPath: database_repository
+          readinessProbe:
+            httpGet:
+              path: /nifi
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /nifi
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: nifi-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

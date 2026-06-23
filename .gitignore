@@ -1,0 +1,24 @@
+# Vault secrets
+**/vault-init-*.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Data files
+*.parquet
+*.csv
+*.jar
+
+# Test data
+napas-local/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

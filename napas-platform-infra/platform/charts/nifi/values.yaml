@@ -1,0 +1,33 @@
+image:
+  repository: apache/nifi
+  tag: "1.25.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+auth:
+  singleUser:
+    username: admin
+    password: "NiFiAdmin@2024"
+
+sensitivePropsKey: "NAPaSSensitiveKey2024MinLength12"
+
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2000m"
+
+persistence:
+  enabled: true
+  size: 20Gi
+
+service:
+  type: ClusterIP
+  httpsPort: 8443
+
+jvm:
+  heapInit: "1g"
+  heapMax: "2g"

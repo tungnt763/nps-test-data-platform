@@ -1,0 +1,10 @@
+primary:
+  persistence:
+    size: {{ .Values.ranger.postgres.storage }}
+  resources:
+    requests:
+      cpu: {{ .Values.ranger.postgres.resources.requests.cpu | quote }}
+      memory: {{ .Values.ranger.postgres.resources.requests.memory | quote }}
+    limits:
+      cpu: {{ .Values.ranger.postgres.resources.limits.cpu | quote }}
+      memory: {{ .Values.ranger.postgres.resources.limits.memory | quote }}

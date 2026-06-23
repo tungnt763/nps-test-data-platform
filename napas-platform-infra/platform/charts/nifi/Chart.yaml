@@ -1,0 +1,6 @@
+apiVersion: v2
+name: nifi
+description: Apache NiFi - Data Flow Automation & Orchestration
+type: application
+version: 0.1.0
+appVersion: "1.25.0"

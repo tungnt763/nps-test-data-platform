@@ -1,0 +1,17 @@
+auth:
+  database: ranger
+  username: ranger
+  password: "Ranger@Postgres2024"
+
+primary:
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"

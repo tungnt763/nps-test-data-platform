@@ -1,0 +1,38 @@
+image:
+  repository: dremio/dremio-oss
+  tag: "24.3.2"
+  pullPolicy: IfNotPresent
+
+coordinator:
+  count: 1
+  memory: 4096
+  cpu: 2
+  volumeSize: "30Gi"
+
+executor:
+  count: 1
+  memory: 4096
+  cpu: 2
+  volumeSize: "20Gi"
+
+zookeeper:
+  enabled: false
+
+service:
+  type: ClusterIP
+  webPort: 9047
+  flightPort: 32010
+  jdbcPort: 31010
+
+distStorage:
+  type: "aws"
+  aws:
+    bucketName: "napas-datalake"
+    path: "/.dremio-internal"
+    authentication: "accessKeySecret"
+    credentials:
+      accessKey: "napas-admin"
+      secret: "napas-minio-s3cr3t-2024"
+    endpoint: "http://minio.data-storage.svc.cluster.local:9000"
+    allowUntrustedCertificates: true
+    enablePathStyleAccess: true

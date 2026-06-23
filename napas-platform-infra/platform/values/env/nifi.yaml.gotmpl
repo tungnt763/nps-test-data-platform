@@ -1,0 +1,7 @@
+resources:
+  requests:
+    memory: {{ .Values.nifi.resources.requests.memory | quote }}
+    cpu: {{ .Values.nifi.resources.requests.cpu | quote }}
+  limits:
+    memory: {{ .Values.nifi.resources.limits.memory | quote }}
+    cpu: {{ .Values.nifi.resources.limits.cpu | quote }}

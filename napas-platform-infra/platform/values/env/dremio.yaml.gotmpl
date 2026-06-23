@@ -1,0 +1,19 @@
+coordinator:
+  count: {{ .Values.dremio.coordinator.count }}
+  memory: {{ .Values.dremio.coordinator.memory }}
+  cpu: {{ .Values.dremio.coordinator.cpu }}
+  volumeSize: {{ .Values.dremio.coordinator.storage | quote }}
+
+executor:
+  count: {{ .Values.dremio.executor.count }}
+  memory: {{ .Values.dremio.executor.memory }}
+  cpu: {{ .Values.dremio.executor.cpu }}
+  volumeSize: {{ .Values.dremio.executor.storage | quote }}
+
+distStorage:
+  aws:
+    endpoint: {{ .Values.dremio.minio.endpoint | quote }}
+    bucketName: {{ .Values.dremio.minio.bucket | quote }}
+    credentials:
+      accessKey: {{ .Values.dremio.minio.accessKey | quote }}
+      secret: {{ .Values.dremio.minio.secretKey | quote }}
