@@ -68,12 +68,10 @@ NiFi cần Dremio JDBC driver để kết nối Dremio qua JDBC (port 31010).
 
 ```bash
 # Download Dremio JDBC driver vào NiFi pod
-kubectl exec -n data-ingestion nifi-0 -- \
-  curl -L -o /opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar \
-  "https://download.dremio.com/jdbc-driver/24.3.2/dremio-jdbc-driver-24.3.2-202401241530580032-1f14e76d.jar"
+kubectl exec -n data-ingestion nifi-0 -- curl -L -o /opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar "https://download.dremio.com/jdbc-driver/24.3.2-202401241821100032-d2d8a497/dremio-jdbc-driver-24.3.2-202401241821100032-d2d8a497.jar"
 
 # Verify
-kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/dremio-jdbc-driver*.jar
+kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar
 ```
 
 > **Lưu ý:** Driver mất khi pod restart. Xem phần 8 để setup initContainer cho permanent fix.
@@ -82,9 +80,9 @@ kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/dremi
 
 ```bash
 # Download PostgreSQL JDBC driver (nếu chưa có)
-kubectl exec -n data-ingestion nifi-0 -- \
-  curl -L -o /opt/nifi/nifi-current/lib/postgresql-42.7.2.jar \
-  "https://jdbc.postgresql.org/download/postgresql-42.7.2.jar"
+kubectl exec -n data-ingestion nifi-0 -- curl -L -o /opt/nifi/nifi-current/lib/postgresql-42.7.2.jar "https://jdbc.postgresql.org/download/postgresql-42.7.2.jar"
+
+kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/postgresql-42.7.2.jar
 ```
 
 ### 2.3 Restart NiFi để load drivers
@@ -110,7 +108,7 @@ Truy cập NiFi UI: `https://localhost:8444/nifi`
 |-----------------------------|-----------------------------------------------------------------|
 | **Name**                    | `dremio-jdbc-pool`                                              |
 | **Type**                    | `DBCPConnectionPool`                                            |
-| **Database Connection URL** | `jdbc:dremio:direct=dremio-service.data-processing.svc.cluster.local:31010` |
+| **Database Connection URL** | `jdbc:dremio:direct=dremio.data-processing.svc.cluster.local:31010` |
 | **Database Driver Class Name** | `com.dremio.jdbc.Driver`                                     |
 | **Database Driver Location(s)** | `/opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar` |
 | **Database User**           | `admin`                                                         |
@@ -126,7 +124,7 @@ Truy cập NiFi UI: `https://localhost:8444/nifi`
 |-----------------------------|-----------------------------------------------------------------|
 | **Name**                    | `source-postgres-pool`                                          |
 | **Type**                    | `DBCPConnectionPool`                                            |
-| **Database Connection URL** | `jdbc:postgresql://superset-postgresql.data-visualization.svc.cluster.local:5432/superset` |
+| **Database Connection URL** | `jdbc:postgresql://postgres-superset-postgresql.data-visualization.svc.cluster.local:5432/superset` |
 | **Database Driver Class Name** | `org.postgresql.Driver`                                      |
 | **Database Driver Location(s)** | `/opt/nifi/nifi-current/lib/postgresql-42.7.2.jar`          |
 | **Database User**           | `superset`                                                      |
@@ -198,7 +196,6 @@ Processor này trigger pipeline theo schedule.
 | **Name**                       | `Read Active Pipeline Configs`                                       |
 | **Database Connection Pooling Service** | `dremio-jdbc-pool`                                            |
 | **SQL select query**           | (xem bên dưới)                                                       |
-| **Output Format**              | `Avro`                                                               |
 | **Max Rows Per Flow File**     | `0` (unlimited)                                                      |
 
 **SQL Query:**
@@ -221,7 +218,7 @@ SELECT
     schedule_cron,
     is_active,
     description
-FROM minio_source.metadata.pipeline_config
+FROM minio-datalake.metadata.pipeline_config
 WHERE is_active = true
 ORDER BY pipeline_id
 ```
@@ -418,7 +415,7 @@ Tạo **Input Port**: `from-metadata`
 **SQL Query:**
 ```sql
 SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
-FROM minio_source.metadata.pipeline_execution_log
+FROM minio-datalake.metadata.pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'
   AND layer = 'bronze'
   AND status = 'success'
@@ -522,7 +519,7 @@ Cả 2 đường (full + incremental) đều tạo FlowFile chứa SQL query. Gi
 
 **Replacement Value:**
 ```
-INSERT INTO minio_source.metadata.pipeline_execution_log VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_execution_log VALUES (
     '${pipeline_id}_${now():format('yyyyMMdd_HHmmss')}',
     '${pipeline_id}',
     '${pipeline_name}',
@@ -681,8 +678,8 @@ SELECT
     p.target_table,
     p.primary_keys,
     p.watermark_column
-FROM minio_source.metadata.transform_rules r
-JOIN minio_source.metadata.pipeline_config p ON r.pipeline_id = p.pipeline_id
+FROM minio-datalake.metadata.transform_rules r
+JOIN minio-datalake.metadata.pipeline_config p ON r.pipeline_id = p.pipeline_id
 WHERE r.source_layer = 'bronze'
   AND r.target_layer = 'silver'
   AND r.is_active = true

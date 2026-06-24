@@ -74,7 +74,7 @@ Chạy các câu SQL sau trong **Dremio SQL Runner** (hoặc NiFi gọi qua JDBC
 ### 3.1 pipeline_config — Cấu hình pipeline chính
 
 ```sql
-CREATE TABLE minio_source.metadata.pipeline_config (
+CREATE TABLE minio-datalake.metadata.pipeline_config (
     pipeline_id         VARCHAR,
     pipeline_name       VARCHAR,
     source_type         VARCHAR,
@@ -126,7 +126,7 @@ CREATE TABLE minio_source.metadata.pipeline_config (
 ### 3.2 column_mapping — Mapping cột source → target
 
 ```sql
-CREATE TABLE minio_source.metadata.column_mapping (
+CREATE TABLE minio-datalake.metadata.column_mapping (
     mapping_id          VARCHAR,
     pipeline_id         VARCHAR,
     source_column       VARCHAR,
@@ -168,7 +168,7 @@ CREATE TABLE minio_source.metadata.column_mapping (
 ### 3.3 transform_rules — Quy tắc transform silver/gold
 
 ```sql
-CREATE TABLE minio_source.metadata.transform_rules (
+CREATE TABLE minio-datalake.metadata.transform_rules (
     rule_id             VARCHAR,
     pipeline_id         VARCHAR,
     rule_name           VARCHAR,
@@ -214,7 +214,7 @@ CREATE TABLE minio_source.metadata.transform_rules (
 ### 3.4 data_quality_rules — Quy tắc kiểm tra chất lượng
 
 ```sql
-CREATE TABLE minio_source.metadata.data_quality_rules (
+CREATE TABLE minio-datalake.metadata.data_quality_rules (
     dq_rule_id          VARCHAR,
     pipeline_id         VARCHAR,
     target_layer        VARCHAR,
@@ -255,7 +255,7 @@ CREATE TABLE minio_source.metadata.data_quality_rules (
 ### 3.5 pipeline_execution_log — Lịch sử chạy pipeline
 
 ```sql
-CREATE TABLE minio_source.metadata.pipeline_execution_log (
+CREATE TABLE minio-datalake.metadata.pipeline_execution_log (
     execution_id        VARCHAR,
     pipeline_id         VARCHAR,
     pipeline_name       VARCHAR,
@@ -292,7 +292,7 @@ CREATE TABLE minio_source.metadata.pipeline_execution_log (
 
 ```sql
 -- Pipeline 1: Ingest transactions (incremental)
-INSERT INTO minio_source.metadata.pipeline_config VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
     'P001',
     'ingest_transactions',
     'jdbc',
@@ -315,7 +315,7 @@ INSERT INTO minio_source.metadata.pipeline_config VALUES (
 );
 
 -- Pipeline 2: Ingest merchants (full load, bảng nhỏ)
-INSERT INTO minio_source.metadata.pipeline_config VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
     'P002',
     'ingest_merchants',
     'jdbc',
@@ -338,7 +338,7 @@ INSERT INTO minio_source.metadata.pipeline_config VALUES (
 );
 
 -- Pipeline 3: Ingest bank_codes (full load, reference data)
-INSERT INTO minio_source.metadata.pipeline_config VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
     'P003',
     'ingest_bank_codes',
     'jdbc',
@@ -361,7 +361,7 @@ INSERT INTO minio_source.metadata.pipeline_config VALUES (
 );
 
 -- Pipeline 4: Ingest settlements (incremental)
-INSERT INTO minio_source.metadata.pipeline_config VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
     'P004',
     'ingest_settlements',
     'jdbc',
@@ -388,7 +388,7 @@ INSERT INTO minio_source.metadata.pipeline_config VALUES (
 
 ```sql
 -- Transactions column mappings
-INSERT INTO minio_source.metadata.column_mapping VALUES
+INSERT INTO minio-datalake.metadata.column_mapping VALUES
 ('M001', 'P001', 'txn_id',           'txn_id',              'VARCHAR',        NULL,                                    true,  false, NULL, 1, 'Primary key'),
 ('M002', 'P001', 'amount',           'transaction_amount',  'DECIMAL(18,2)',  'CAST(${src} AS DECIMAL(18,2))',         false, false, NULL, 2, 'Transaction amount'),
 ('M003', 'P001', 'currency',         'currency_code',       'VARCHAR',        'UPPER(TRIM(${src}))',                   false, false, '''VND''', 3, 'ISO currency code'),
@@ -404,32 +404,32 @@ INSERT INTO minio_source.metadata.column_mapping VALUES
 
 ```sql
 -- Silver: Dedup transactions
-INSERT INTO minio_source.metadata.transform_rules VALUES (
+INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'T001', 'P001', 'dedup_transactions',
     'bronze', 'silver', 'dedup',
-    'CREATE TABLE minio_source.silver.transactions AS
+    'CREATE TABLE minio-datalake.silver.transactions AS
      SELECT * FROM (
        SELECT *,
          ROW_NUMBER() OVER (
            PARTITION BY txn_id
            ORDER BY created_at DESC
          ) AS rn
-       FROM minio_source.bronze.transactions
+       FROM minio-datalake.bronze.transactions
      ) WHERE rn = 1',
     NULL, 1, true,
     'Remove duplicate transactions, keep latest by created_at'
 );
 
 -- Silver: Merge incremental
-INSERT INTO minio_source.metadata.transform_rules VALUES (
+INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'T002', 'P001', 'merge_transactions',
     'bronze', 'silver', 'merge',
-    'MERGE INTO minio_source.silver.transactions AS target
+    'MERGE INTO minio-datalake.silver.transactions AS target
      USING (
        SELECT * FROM (
          SELECT *,
            ROW_NUMBER() OVER (PARTITION BY txn_id ORDER BY created_at DESC) AS rn
-         FROM minio_source.bronze.transactions
+         FROM minio-datalake.bronze.transactions
          WHERE created_at > ''${last_watermark}''
        ) WHERE rn = 1
      ) AS source
@@ -441,10 +441,10 @@ INSERT INTO minio_source.metadata.transform_rules VALUES (
 );
 
 -- Gold: Daily transaction summary
-INSERT INTO minio_source.metadata.transform_rules VALUES (
+INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'T003', 'P001', 'daily_txn_summary',
     'silver', 'gold', 'aggregate',
-    'CREATE OR REPLACE VIEW minio_source.gold.daily_transaction_summary AS
+    'CREATE OR REPLACE VIEW minio-datalake.gold.daily_transaction_summary AS
      SELECT
        CAST(created_at AS DATE) AS transaction_date,
        bank_code,
@@ -455,7 +455,7 @@ INSERT INTO minio_source.metadata.transform_rules VALUES (
        AVG(transaction_amount) AS avg_amount,
        MIN(transaction_amount) AS min_amount,
        MAX(transaction_amount) AS max_amount
-     FROM minio_source.silver.transactions
+     FROM minio-datalake.silver.transactions
      GROUP BY
        CAST(created_at AS DATE),
        bank_code,
@@ -466,10 +466,10 @@ INSERT INTO minio_source.metadata.transform_rules VALUES (
 );
 
 -- Gold: Bank performance KPIs
-INSERT INTO minio_source.metadata.transform_rules VALUES (
+INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'T004', 'P001', 'bank_performance_kpis',
     'silver', 'gold', 'aggregate',
-    'CREATE OR REPLACE VIEW minio_source.gold.bank_performance_kpis AS
+    'CREATE OR REPLACE VIEW minio-datalake.gold.bank_performance_kpis AS
      SELECT
        bank_code,
        COUNT(*) AS total_transactions,
@@ -479,7 +479,7 @@ INSERT INTO minio_source.metadata.transform_rules VALUES (
          NULLIF(COUNT(*), 0) * 100 AS success_rate_pct,
        SUM(transaction_amount) AS total_volume,
        AVG(transaction_amount) AS avg_transaction_value
-     FROM minio_source.silver.transactions
+     FROM minio-datalake.silver.transactions
      GROUP BY bank_code',
     'T002', 4, true,
     'Bank-level performance metrics'
@@ -490,28 +490,28 @@ INSERT INTO minio_source.metadata.transform_rules VALUES (
 
 ```sql
 -- DQ: transactions.txn_id not null
-INSERT INTO minio_source.metadata.data_quality_rules VALUES (
+INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
     'DQ001', 'P001', 'silver', 'transactions', 'txn_id',
     'not_null', '${column} IS NOT NULL', 'critical', 0.0, true,
     'Transaction ID must never be null'
 );
 
 -- DQ: transactions.amount positive
-INSERT INTO minio_source.metadata.data_quality_rules VALUES (
+INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
     'DQ002', 'P001', 'silver', 'transactions', 'transaction_amount',
     'range', '${column} >= 0', 'error', 1.0, true,
     'Transaction amount must be non-negative (allow 1% tolerance)'
 );
 
 -- DQ: transactions.bank_code format
-INSERT INTO minio_source.metadata.data_quality_rules VALUES (
+INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
     'DQ003', 'P001', 'silver', 'transactions', 'bank_code',
     'regex', 'LENGTH(${column}) = 9', 'warning', 5.0, true,
     'Bank code should be 9 digits (NAPAS format)'
 );
 
 -- DQ: transactions freshness
-INSERT INTO minio_source.metadata.data_quality_rules VALUES (
+INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
     'DQ004', 'P001', 'silver', 'transactions', 'created_at',
     'freshness',
     'MAX(${column}) >= CURRENT_TIMESTAMP - INTERVAL ''2'' DAY',
@@ -520,7 +520,7 @@ INSERT INTO minio_source.metadata.data_quality_rules VALUES (
 );
 
 -- DQ: transactions unique txn_id
-INSERT INTO minio_source.metadata.data_quality_rules VALUES (
+INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
     'DQ005', 'P001', 'silver', 'transactions', 'txn_id',
     'unique',
     'COUNT(*) = COUNT(DISTINCT ${column})',
@@ -666,23 +666,23 @@ Sau khi tạo xong, kiểm tra trong Dremio SQL Runner:
 ```sql
 -- Kiểm tra pipeline config
 SELECT pipeline_id, pipeline_name, source_table, load_type, is_active
-FROM minio_source.metadata.pipeline_config;
+FROM minio-datalake.metadata.pipeline_config;
 
 -- Kiểm tra column mappings cho transactions
 SELECT source_column, target_column, data_type, transformation
-FROM minio_source.metadata.column_mapping
+FROM minio-datalake.metadata.column_mapping
 WHERE pipeline_id = 'P001'
 ORDER BY column_order;
 
 -- Kiểm tra transform rules
 SELECT rule_name, source_layer, target_layer, transform_type, execution_order
-FROM minio_source.metadata.transform_rules
+FROM minio-datalake.metadata.transform_rules
 WHERE pipeline_id = 'P001'
 ORDER BY execution_order;
 
 -- Kiểm tra DQ rules
 SELECT column_name, rule_type, severity
-FROM minio_source.metadata.data_quality_rules
+FROM minio-datalake.metadata.data_quality_rules
 WHERE pipeline_id = 'P001';
 
 -- Kiểm tra source data

@@ -126,7 +126,7 @@ NiFi gửi SQL qua Dremio JDBC → Dremio execute trên Iceberg tables.
 -- Transform type: create_table
 -- Chạy lần đầu, sau đó chuyển sang MERGE
 
-CREATE TABLE IF NOT EXISTS minio_source.silver.${target_table} AS
+CREATE TABLE IF NOT EXISTS minio-datalake.silver.${target_table} AS
 SELECT *
 FROM (
     SELECT *,
@@ -134,7 +134,7 @@ FROM (
             PARTITION BY ${primary_keys}
             ORDER BY ${watermark_column} DESC
         ) AS _row_num
-    FROM minio_source.bronze.${source_table}
+    FROM minio-datalake.bronze.${source_table}
 ) deduped
 WHERE _row_num = 1
 ```
@@ -155,7 +155,7 @@ WHERE _row_num = 1
 -- Input: bronze table có duplicate
 -- Output: silver table không duplicate
 
-CREATE OR REPLACE TABLE minio_source.silver.${target_table} AS
+CREATE OR REPLACE TABLE minio-datalake.silver.${target_table} AS
 SELECT * EXCEPT(_row_num)
 FROM (
     SELECT *,
@@ -163,7 +163,7 @@ FROM (
             PARTITION BY ${primary_keys}
             ORDER BY ${watermark_column} DESC
         ) AS _row_num
-    FROM minio_source.bronze.${source_table}
+    FROM minio-datalake.bronze.${source_table}
 ) deduped
 WHERE _row_num = 1
 ```
@@ -180,7 +180,7 @@ WHERE _row_num = 1
 -- Transform type: merge
 -- Upsert: INSERT nếu chưa có, UPDATE nếu đã tồn tại
 
-MERGE INTO minio_source.silver.${target_table} AS target
+MERGE INTO minio-datalake.silver.${target_table} AS target
 USING (
     SELECT * FROM (
         SELECT *,
@@ -188,7 +188,7 @@ USING (
                 PARTITION BY ${primary_keys}
                 ORDER BY ${watermark_column} DESC
             ) AS _row_num
-        FROM minio_source.bronze.${source_table}
+        FROM minio-datalake.bronze.${source_table}
         WHERE ${watermark_column} > '${last_watermark}'
     ) WHERE _row_num = 1
 ) AS source
@@ -214,7 +214,7 @@ WHEN NOT MATCHED THEN
 -- Transform type: merge
 -- Áp dụng CAST, COALESCE, TRIM, etc. từ column_mapping
 
-MERGE INTO minio_source.silver.${target_table} AS target
+MERGE INTO minio-datalake.silver.${target_table} AS target
 USING (
     SELECT
         txn_id,
@@ -232,7 +232,7 @@ USING (
                 PARTITION BY txn_id
                 ORDER BY created_at DESC
             ) AS _row_num
-        FROM minio_source.bronze.transactions
+        FROM minio-datalake.bronze.transactions
         WHERE created_at > '${last_watermark}'
     ) WHERE _row_num = 1
 ) AS source
@@ -259,7 +259,7 @@ WHEN NOT MATCHED THEN
 -- Transform type: filter
 -- Ví dụ: chỉ giữ transactions thành công
 
-DELETE FROM minio_source.silver.${target_table}
+DELETE FROM minio-datalake.silver.${target_table}
 WHERE status_code NOT IN ('00', '01')
 ```
 
@@ -270,9 +270,9 @@ Hoặc tạo filtered view:
 -- Transform type: filter
 -- Tạo view chỉ chứa valid records
 
-CREATE OR REPLACE VIEW minio_source.silver.${target_table}_valid AS
+CREATE OR REPLACE VIEW minio-datalake.silver.${target_table}_valid AS
 SELECT *
-FROM minio_source.silver.${target_table}
+FROM minio-datalake.silver.${target_table}
 WHERE status_code = '00'
   AND transaction_amount > 0
   AND bank_code IS NOT NULL
@@ -291,7 +291,7 @@ Gold layer tạo business-ready datasets: aggregations, KPIs, joined tables.
 -- Transform type: aggregate
 -- KPI hàng ngày cho transactions
 
-CREATE OR REPLACE VIEW minio_source.gold.daily_${target_table}_summary AS
+CREATE OR REPLACE VIEW minio-datalake.gold.daily_${target_table}_summary AS
 SELECT
     CAST(created_at AS DATE)                AS transaction_date,
     bank_code,
@@ -308,7 +308,7 @@ SELECT
     CAST(SUM(CASE WHEN status_code = '00'
         THEN 1 ELSE 0 END) AS DOUBLE)
         / NULLIF(COUNT(*), 0) * 100        AS success_rate_pct
-FROM minio_source.silver.${source_table}
+FROM minio-datalake.silver.${source_table}
 GROUP BY
     CAST(created_at AS DATE),
     bank_code,
@@ -322,7 +322,7 @@ GROUP BY
 -- Transform type: aggregate
 -- KPIs theo entity (bank, merchant, etc.)
 
-CREATE OR REPLACE VIEW minio_source.gold.bank_performance AS
+CREATE OR REPLACE VIEW minio-datalake.gold.bank_performance AS
 SELECT
     t.bank_code,
     b.bank_name,
@@ -352,8 +352,8 @@ SELECT
     SUM(CASE WHEN t.transaction_type = 'PAYMENT'
         THEN 1 ELSE 0 END)                 AS payment_count
 
-FROM minio_source.silver.transactions t
-LEFT JOIN minio_source.silver.bank_codes b
+FROM minio-datalake.silver.transactions t
+LEFT JOIN minio-datalake.silver.bank_codes b
     ON t.bank_code = b.bank_code
 GROUP BY t.bank_code, b.bank_name, b.bank_short_name
 ```
@@ -364,7 +364,7 @@ GROUP BY t.bank_code, b.bank_name, b.bank_short_name
 -- Template ID: GOLD_MERCHANT_ANALYTICS
 -- Transform type: aggregate
 
-CREATE OR REPLACE VIEW minio_source.gold.merchant_analytics AS
+CREATE OR REPLACE VIEW minio-datalake.gold.merchant_analytics AS
 SELECT
     t.merchant_id,
     m.merchant_name,
@@ -379,8 +379,8 @@ SELECT
     CAST(SUM(CASE WHEN t.status_code = '00'
         THEN 1 ELSE 0 END) AS DOUBLE)
         / NULLIF(COUNT(*), 0) * 100        AS success_rate_pct
-FROM minio_source.silver.transactions t
-LEFT JOIN minio_source.silver.merchants m
+FROM minio-datalake.silver.transactions t
+LEFT JOIN minio-datalake.silver.merchants m
     ON t.merchant_id = m.merchant_id
 GROUP BY t.merchant_id, m.merchant_name, m.category, m.city
 ```
@@ -392,7 +392,7 @@ GROUP BY t.merchant_id, m.merchant_name, m.category, m.city
 -- Transform type: aggregate
 -- So khớp giao dịch vs quyết toán
 
-CREATE OR REPLACE VIEW minio_source.gold.settlement_reconciliation AS
+CREATE OR REPLACE VIEW minio-datalake.gold.settlement_reconciliation AS
 SELECT
     s.settlement_id,
     s.bank_code,
@@ -410,18 +410,18 @@ SELECT
         WHEN t.actual_count IS NULL THEN 'NO_TRANSACTIONS'
         ELSE 'MISMATCH'
     END AS recon_status
-FROM minio_source.silver.settlements s
+FROM minio-datalake.silver.settlements s
 LEFT JOIN (
     SELECT
         bank_code,
         CAST(created_at AS DATE) AS txn_date,
         COUNT(*) AS actual_count,
         SUM(transaction_amount) AS actual_amount
-    FROM minio_source.silver.transactions
+    FROM minio-datalake.silver.transactions
     WHERE status_code = '00'
     GROUP BY bank_code, CAST(created_at AS DATE)
 ) t ON s.bank_code = t.bank_code AND s.settlement_date = t.txn_date
-LEFT JOIN minio_source.silver.bank_codes b ON s.bank_code = b.bank_code
+LEFT JOIN minio-datalake.silver.bank_codes b ON s.bank_code = b.bank_code
 ```
 
 ### 4.5 Hourly Trend Analysis
@@ -431,14 +431,14 @@ LEFT JOIN minio_source.silver.bank_codes b ON s.bank_code = b.bank_code
 -- Transform type: aggregate
 -- Phân tích xu hướng theo giờ
 
-CREATE OR REPLACE VIEW minio_source.gold.hourly_transaction_trend AS
+CREATE OR REPLACE VIEW minio-datalake.gold.hourly_transaction_trend AS
 SELECT
     CAST(created_at AS DATE) AS transaction_date,
     EXTRACT(HOUR FROM created_at) AS hour_of_day,
     COUNT(*) AS transaction_count,
     SUM(transaction_amount) AS total_amount,
     AVG(transaction_amount) AS avg_amount
-FROM minio_source.silver.transactions
+FROM minio-datalake.silver.transactions
 WHERE status_code = '00'
 GROUP BY CAST(created_at AS DATE), EXTRACT(HOUR FROM created_at)
 ORDER BY transaction_date, hour_of_day
@@ -469,7 +469,7 @@ SELECT
         WHEN SUM(CASE WHEN ${column_name} IS NULL THEN 1 ELSE 0 END) = 0 THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio_source.${target_layer}.${target_table}
+FROM minio-datalake.${target_layer}.${target_table}
 ```
 
 ### 5.2 Uniqueness Check
@@ -489,7 +489,7 @@ SELECT
         WHEN COUNT(*) = COUNT(DISTINCT ${column_name}) THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio_source.${target_layer}.${target_table}
+FROM minio-datalake.${target_layer}.${target_table}
 ```
 
 ### 5.3 Range Check
@@ -512,7 +512,7 @@ SELECT
             / NULLIF(COUNT(*), 0) * 100 <= ${threshold_pct} THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio_source.${target_layer}.${target_table}
+FROM minio-datalake.${target_layer}.${target_table}
 ```
 
 ### 5.4 Freshness Check
@@ -532,7 +532,7 @@ SELECT
         WHEN ${rule_expression} THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio_source.${target_layer}.${target_table}
+FROM minio-datalake.${target_layer}.${target_table}
 ```
 
 ### 5.5 DQ Summary Query
@@ -554,7 +554,7 @@ SELECT
         WHEN SUM(CASE WHEN status = 'FAIL' THEN 1 ELSE 0 END) = 0 THEN 'ALL_PASSED'
         ELSE 'HAS_FAILURES'
     END AS overall_status
-FROM minio_source.metadata.pipeline_execution_log
+FROM minio-datalake.metadata.pipeline_execution_log
 WHERE layer = 'dq_check'
   AND CAST(start_time AS DATE) = CURRENT_DATE
 GROUP BY pipeline_id, pipeline_name, layer
@@ -573,7 +573,7 @@ SELECT COALESCE(
     MAX(last_watermark),
     '1970-01-01 00:00:00'
 ) AS last_watermark
-FROM minio_source.metadata.pipeline_execution_log
+FROM minio-datalake.metadata.pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'
   AND layer = 'bronze'
   AND status = 'success'
@@ -584,7 +584,7 @@ WHERE pipeline_id = '${pipeline_id}'
 ```sql
 -- Dùng bởi NiFi sau mỗi lần chạy pipeline
 
-INSERT INTO minio_source.metadata.pipeline_execution_log
+INSERT INTO minio-datalake.metadata.pipeline_execution_log
 VALUES (
     '${pipeline_id}_${now():format("yyyyMMdd_HHmmss")}',
     '${pipeline_id}',
@@ -616,7 +616,7 @@ SELECT
     data_type,
     transformation,
     column_order
-FROM minio_source.metadata.column_mapping
+FROM minio-datalake.metadata.column_mapping
 WHERE pipeline_id = '${pipeline_id}'
 ORDER BY column_order
 ```
