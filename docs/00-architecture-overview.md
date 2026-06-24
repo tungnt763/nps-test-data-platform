@@ -245,5 +245,16 @@ docker   >= 25.0
 | `05-dremio.md`            | Dremio            | 5            |
 | `06-apache-superset.md`   | Apache Superset   | 6            |
 | `07-integration-guide.md` | End-to-End Flow   | Reference    |
+| `08-nifi-pipeline-guide.md` | NiFi Pipeline Demo | Tutorial  |
 
 > Mỗi file có cấu trúc: **Là gì → Kiến trúc → Hoạt động → Tương tác → Pros/Cons → Cài đặt → Validate**
+
+### Metadata-Driven Pipeline (Advanced)
+
+| File                      | Nội dung                          | Mục đích               |
+|---------------------------|-----------------------------------|------------------------|
+| `09-metadata-driven-strategy.md` | Chiến lược metadata-driven  | Architecture & Design  |
+| `10-metadata-tables-design.md`   | Schema metadata tables      | DDL & Sample Data      |
+| `11-nifi-dynamic-pipeline-setup.md` | NiFi Process Group setup | Build Pipeline         |
+| `12-dynamic-sql-templates.md`    | SQL templates reference     | Bronze/Silver/Gold SQL |
+| `13-pipeline-operations-runbook.md` | Operations guide         | Day-to-day Operations  |
