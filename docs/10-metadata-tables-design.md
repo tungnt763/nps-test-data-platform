@@ -229,6 +229,22 @@ CREATE TABLE minio-datalake.metadata.data_quality_rules (
 );
 ```
 
+**Giải thích từng field:**
+
+| Field              | Kiểu     | Mô tả                                                         | Ví dụ                                              |
+|--------------------|----------|----------------------------------------------------------------|-----------------------------------------------------|
+| `dq_rule_id`       | VARCHAR  | ID duy nhất cho DQ rule                                        | `DQ001`                                             |
+| `pipeline_id`      | VARCHAR  | FK → pipeline_config, rule thuộc pipeline nào                  | `P001`                                              |
+| `target_layer`     | VARCHAR  | Layer cần check (sau transform)                                | `silver`, `gold`                                    |
+| `target_table`     | VARCHAR  | Bảng cần check                                                 | `transactions`                                      |
+| `column_name`      | VARCHAR  | Cột cần kiểm tra                                               | `txn_id`, `transaction_amount`, `bank_code`         |
+| `rule_type`        | VARCHAR  | Loại kiểm tra (xem bảng bên dưới)                             | `not_null`, `unique`, `range`, `regex`              |
+| `rule_expression`  | VARCHAR  | SQL boolean expression, dùng `${column}` làm placeholder       | `${column} IS NOT NULL`, `${column} >= 0`           |
+| `severity`         | VARCHAR  | Mức độ nghiêm trọng khi fail (xem bảng bên dưới)              | `info`, `warning`, `error`, `critical`              |
+| `threshold_pct`    | DOUBLE   | % rows fail cho phép (0.0 = không chấp nhận bất kỳ failure)   | `0.0` (strict), `1.0` (cho phép 1% fail), `5.0`    |
+| `is_active`        | BOOLEAN  | Rule có đang active không                                       | `true`, `false`                                     |
+| `description`      | VARCHAR  | Mô tả rule                                                     | `Transaction ID must never be null`                 |
+
 **`rule_type` options:**
 
 | Type      | Expression example                                  | Mô tả                          |
@@ -273,6 +289,26 @@ CREATE TABLE minio-datalake.metadata.pipeline_execution_log (
     created_at          TIMESTAMP
 );
 ```
+
+**Giải thích từng field:**
+
+| Field              | Kiểu      | Mô tả                                                         | Ví dụ                                              |
+|--------------------|-----------|----------------------------------------------------------------|-----------------------------------------------------|
+| `execution_id`     | VARCHAR   | ID duy nhất cho mỗi lần chạy                                   | `P001_20260624_020000`                              |
+| `pipeline_id`      | VARCHAR   | FK → pipeline_config, pipeline nào đã chạy                     | `P001`                                              |
+| `pipeline_name`    | VARCHAR   | Tên pipeline (denormalized, tiện query)                        | `ingest_transactions`                               |
+| `layer`            | VARCHAR   | Layer đã xử lý trong lần chạy này                              | `bronze`, `silver`, `gold`, `dq_check`              |
+| `start_time`       | TIMESTAMP | Thời gian bắt đầu chạy                                        | `2026-06-24 02:00:00`                               |
+| `end_time`         | TIMESTAMP | Thời gian kết thúc                                             | `2026-06-24 02:05:30`                               |
+| `status`           | VARCHAR   | Trạng thái kết quả (xem bảng bên dưới)                        | `success`, `failed`, `running`                      |
+| `rows_processed`   | BIGINT    | Tổng số rows đã xử lý                                         | `15000`                                             |
+| `rows_inserted`    | BIGINT    | Số rows INSERT mới                                             | `12000`                                             |
+| `rows_updated`     | BIGINT    | Số rows UPDATE (MERGE matched)                                 | `3000`                                              |
+| `rows_rejected`    | BIGINT    | Số rows bị reject (DQ fail, parse error)                       | `5`                                                 |
+| `last_watermark`   | VARCHAR   | Giá trị watermark mới nhất sau lần chạy (dùng cho incremental) | `2026-06-24 01:59:59`                               |
+| `error_message`    | VARCHAR   | Chi tiết lỗi nếu status = failed (NULL nếu success)           | `Connection refused`, `OOM`, `NULL`                 |
+| `execution_params` | VARCHAR   | Tham số runtime (load_type, batch_size, ...)                   | `incremental`, `full`                               |
+| `created_at`       | TIMESTAMP | Thời gian ghi log                                              | `2026-06-24 02:05:30`                               |
 
 **`status` values:**
 
