@@ -112,145 +112,147 @@ WHERE CAST(${partition_columns} AS DATE) = CURRENT_DATE
 
 ---
 
-## 3. Silver Layer — Transform Templates
+## 3. Silver Layer — Transform Templates (Staging Pattern)
 
-Silver transforms chạy trên **Dremio**, orchestrate bởi NiFi.
-NiFi gửi SQL qua Dremio JDBC → Dremio execute trên Iceberg tables.
+Silver transforms chạy trên **Dremio**, orchestrate bởi NiFi (NiFi gửi SQL qua Dremio JDBC).
 
-### 3.1 Create Table (First Run)
+> **Nguyên tắc: KHÔNG transform/merge trực tiếp từ bronze vào silver.** Mỗi lần chạy đi qua một
+> **bảng staging trung gian** (transient) trong schema `"minio-datalake"."staging"`:
+>
+> ```
+> bronze ──(1) STAGE LOAD (full/incr + cast/clean)──▶ staging.${target_table}
+>                                                          │
+>                                          (2) DEDUP in place trên staging
+>                                                          │
+>                            (3) ENSURE target ──▶ (4) MERGE staging ──▶ silver.${target_table}
+>                                                          │
+>                                              (5) CLEANUP: drop staging
+> ```
+>
+> **Vì sao đúng đắn hơn:** tách extract/filter (load) khỏi transform (dedup) khỏi publish (merge);
+> incremental chỉ kéo & dedup phần data mới rồi upsert; bảng silver chính không bao giờ ở trạng thái
+> dang dở; dễ retry từng bước; dễ debug (kiểm tra staging giữa chừng).
+>
+> Các rule chạy theo `transform_rules.execution_order` trong **cùng một stage silver** (Doc 10 §4.3).
 
-**Khi dùng:** Lần đầu tiên tạo silver table từ bronze.
+> **Chuẩn bị:** tạo schema/folder staging một lần (giống metadata):
+> `mc mb napas/napas-datalake/staging --ignore-existing` — Dremio tự tạo Iceberg table khi CTAS.
+
+### 3.1 Stage Load — Bronze → Staging (Full)
+
+**Khi dùng:** load_type = `full`. Nạp toàn bộ bronze vào staging, áp luôn cast/clean từ `column_mapping`.
 
 ```sql
--- Template ID: SILVER_CREATE_TABLE
--- Transform type: create_table
--- Chạy lần đầu, sau đó chuyển sang MERGE
+-- Template ID: SILVER_STAGE_LOAD_FULL
+-- Transform type: load_stage  | execution_order: 1
 
-CREATE TABLE IF NOT EXISTS minio-datalake.silver.${target_table} AS
-SELECT *
+CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
+SELECT ${column_select_list}
+FROM "minio-datalake"."bronze"."${source_table}"
+```
+
+### 3.2 Stage Load — Bronze → Staging (Incremental)
+
+**Khi dùng:** load_type = `incremental`. Chỉ nạp bronze rows mới hơn watermark của **chính silver**.
+
+```sql
+-- Template ID: SILVER_STAGE_LOAD_INCR
+-- Transform type: load_stage  | execution_order: 1
+
+CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
+SELECT ${column_select_list}
+FROM "minio-datalake"."bronze"."${source_table}"
+WHERE ${watermark_column} > '${last_watermark}'
+```
+
+> `${column_select_list}` do NiFi build từ `column_mapping` (Doc 12 §6.3):
+> `txn_id, CAST(amount AS DECIMAL(18,2)) AS transaction_amount, UPPER(TRIM(currency)) AS currency_code, ...`
+> Nếu chưa cần transform cột, dùng `SELECT *`.
+> `${last_watermark}` lấy từ `pipeline_execution_log` theo `pipeline_id` silver + `layer='silver'` (Doc 11 §7.3).
+
+### 3.3 Dedup trên Staging (in place)
+
+**Khi dùng:** luôn chạy sau stage-load. Khử trùng lặp **trên staging**, ghi đè lại staging.
+
+```sql
+-- Template ID: SILVER_STAGE_DEDUP
+-- Transform type: dedup  | execution_order: 2
+
+CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
+SELECT * EXCEPT (_row_num)
 FROM (
     SELECT *,
         ROW_NUMBER() OVER (
             PARTITION BY ${primary_keys}
             ORDER BY ${watermark_column} DESC
         ) AS _row_num
-    FROM minio-datalake.bronze.${source_table}
-) deduped
+    FROM "minio-datalake"."staging"."${target_table}"
+)
 WHERE _row_num = 1
 ```
 
-> **Giải thích:**
-> - `ROW_NUMBER()`: loại duplicate, giữ record mới nhất
-> - `PARTITION BY ${primary_keys}`: group theo khóa chính
-> - `ORDER BY ${watermark_column} DESC`: record mới nhất có _row_num = 1
-> - `WHERE _row_num = 1`: chỉ lấy record mới nhất
+> Bảng full-load không có watermark → đổi `ORDER BY ${watermark_column} DESC` thành `ORDER BY ${primary_keys}`
+> (giữ 1 bản bất kỳ theo PK). Nếu Dremio không hỗ trợ `* EXCEPT(...)`, liệt kê cột tường minh.
 
-### 3.2 Deduplication (Standalone)
+### 3.4 Ensure Target — tạo silver nếu chưa có
 
-**Khi dùng:** Bronze có thể chứa duplicate rows (multi-run, source issues).
+**Khi dùng:** trước MERGE, đảm bảo bảng silver tồn tại với schema khớp staging.
 
 ```sql
--- Template ID: SILVER_DEDUP
--- Transform type: dedup
--- Input: bronze table có duplicate
--- Output: silver table không duplicate
+-- Template ID: SILVER_ENSURE_TABLE
+-- Transform type: create_table  | execution_order: 3
 
-CREATE OR REPLACE TABLE minio-datalake.silver.${target_table} AS
-SELECT * EXCEPT(_row_num)
-FROM (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY ${primary_keys}
-            ORDER BY ${watermark_column} DESC
-        ) AS _row_num
-    FROM minio-datalake.bronze.${source_table}
-) deduped
-WHERE _row_num = 1
+CREATE TABLE IF NOT EXISTS "minio-datalake"."silver"."${target_table}" AS
+SELECT * FROM "minio-datalake"."staging"."${target_table}" WHERE 1=0
 ```
 
-> **`EXCEPT(_row_num)`**: Dremio syntax để loại bỏ cột helper `_row_num` khỏi output.
-> Nếu Dremio version không hỗ trợ, liệt kê explicit columns thay vì `SELECT *`.
+### 3.5 Merge — Staging → Silver (Incremental upsert)
 
-### 3.3 Merge (Incremental Upsert)
-
-**Khi dùng:** Sau lần đầu, incremental merge data mới vào silver.
+**Khi dùng:** load_type = `incremental`. Upsert từ staging (đã dedup) vào silver.
 
 ```sql
 -- Template ID: SILVER_MERGE
--- Transform type: merge
--- Upsert: INSERT nếu chưa có, UPDATE nếu đã tồn tại
+-- Transform type: merge  | execution_order: 4
 
-MERGE INTO minio-datalake.silver.${target_table} AS target
-USING (
-    SELECT * FROM (
-        SELECT *,
-            ROW_NUMBER() OVER (
-                PARTITION BY ${primary_keys}
-                ORDER BY ${watermark_column} DESC
-            ) AS _row_num
-        FROM minio-datalake.bronze.${source_table}
-        WHERE ${watermark_column} > '${last_watermark}'
-    ) WHERE _row_num = 1
-) AS source
-ON target.${primary_keys} = source.${primary_keys}
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
+MERGE INTO "minio-datalake"."silver"."${target_table}" AS target
+USING "minio-datalake"."staging"."${target_table}" AS source
+ON ${merge_on_clause}
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
 ```
 
-> **Lưu ý composite key:**
-> Nếu `primary_keys = 'txn_id,merchant_id'`, ON clause cần:
-> `ON target.txn_id = source.txn_id AND target.merchant_id = source.merchant_id`
->
-> NiFi có thể generate ON clause từ primary_keys attribute bằng ExecuteScript hoặc ReplaceText pattern.
+> `${merge_on_clause}` do NiFi build từ `primary_keys` (Doc 12 §7.1):
+> `txn_id` → `target.txn_id = source.txn_id`;
+> `txn_id,merchant_id` → `target.txn_id = source.txn_id AND target.merchant_id = source.merchant_id`.
 
-### 3.4 Merge with Column Transformations
+### 3.6 Full Replace — Staging → Silver (thay cho Merge khi full-load)
 
-**Khi dùng:** Merge + apply column transformations từ column_mapping.
+**Khi dùng:** load_type = `full` (reference/master data). Thay toàn bộ silver bằng staging đã dedup —
+tự động loại các bản ghi đã bị xóa ở nguồn. Dùng **thay** §3.5 (không cần MERGE).
 
 ```sql
--- Template ID: SILVER_MERGE_TRANSFORM
--- Transform type: merge
--- Áp dụng CAST, COALESCE, TRIM, etc. từ column_mapping
+-- Template ID: SILVER_FULL_REPLACE
+-- Transform type: merge (full)  | execution_order: 4
 
-MERGE INTO minio-datalake.silver.${target_table} AS target
-USING (
-    SELECT
-        txn_id,
-        CAST(amount AS DECIMAL(18,2)) AS transaction_amount,
-        UPPER(TRIM(currency)) AS currency_code,
-        merchant_id,
-        LPAD(CAST(bank_code AS VARCHAR), 9, '0') AS bank_code,
-        status_code,
-        UPPER(transaction_type) AS transaction_type,
-        CAST(created_at AS TIMESTAMP) AS created_at,
-        CAST(updated_at AS TIMESTAMP) AS updated_at
-    FROM (
-        SELECT *,
-            ROW_NUMBER() OVER (
-                PARTITION BY txn_id
-                ORDER BY created_at DESC
-            ) AS _row_num
-        FROM minio-datalake.bronze.transactions
-        WHERE created_at > '${last_watermark}'
-    ) WHERE _row_num = 1
-) AS source
-ON target.txn_id = source.txn_id
-WHEN MATCHED THEN
-    UPDATE SET *
-WHEN NOT MATCHED THEN
-    INSERT *
+CREATE OR REPLACE TABLE "minio-datalake"."silver"."${target_table}" AS
+SELECT * FROM "minio-datalake"."staging"."${target_table}"
 ```
 
-> **Cách generate dynamic:**
-> NiFi đọc `column_mapping` → build SELECT clause:
-> ```
-> CAST(${src} AS ${data_type}) AS ${tgt}  -- nếu transformation = NULL
-> ${transformation} AS ${tgt}              -- nếu transformation != NULL
-> ```
+> Full-load dùng §3.6 thì **không cần** §3.4 (ENSURE) vì `CREATE OR REPLACE` tự tạo bảng.
 
-### 3.5 Filter (Remove Invalid Records)
+### 3.7 Cleanup — xóa Staging (tùy chọn)
+
+```sql
+-- Template ID: SILVER_CLEANUP
+-- Transform type: custom  | execution_order: 9
+
+DROP TABLE IF EXISTS "minio-datalake"."staging"."${target_table}"
+```
+
+> Tùy chọn vì `SILVER_STAGE_LOAD_*` dùng `CREATE OR REPLACE` nên lần sau tự ghi đè. Drop để tiết kiệm
+> storage / tránh nhầm lẫn khi debug.
+
+### 3.8 Filter (Remove Invalid Records)
 
 **Khi dùng:** Lọc bỏ records không hợp lệ ở silver layer.
 
@@ -259,7 +261,7 @@ WHEN NOT MATCHED THEN
 -- Transform type: filter
 -- Ví dụ: chỉ giữ transactions thành công
 
-DELETE FROM minio-datalake.silver.${target_table}
+DELETE FROM "minio-datalake"."silver".${target_table}
 WHERE status_code NOT IN ('00', '01')
 ```
 
@@ -270,9 +272,9 @@ Hoặc tạo filtered view:
 -- Transform type: filter
 -- Tạo view chỉ chứa valid records
 
-CREATE OR REPLACE VIEW minio-datalake.silver.${target_table}_valid AS
+CREATE OR REPLACE VIEW "minio-datalake"."silver".${target_table}_valid AS
 SELECT *
-FROM minio-datalake.silver.${target_table}
+FROM "minio-datalake"."silver".${target_table}
 WHERE status_code = '00'
   AND transaction_amount > 0
   AND bank_code IS NOT NULL
@@ -291,7 +293,7 @@ Gold layer tạo business-ready datasets: aggregations, KPIs, joined tables.
 -- Transform type: aggregate
 -- KPI hàng ngày cho transactions
 
-CREATE OR REPLACE VIEW minio-datalake.gold.daily_${target_table}_summary AS
+CREATE OR REPLACE VIEW "minio-datalake"."gold".daily_${target_table}_summary AS
 SELECT
     CAST(created_at AS DATE)                AS transaction_date,
     bank_code,
@@ -308,7 +310,7 @@ SELECT
     CAST(SUM(CASE WHEN status_code = '00'
         THEN 1 ELSE 0 END) AS DOUBLE)
         / NULLIF(COUNT(*), 0) * 100        AS success_rate_pct
-FROM minio-datalake.silver.${source_table}
+FROM "minio-datalake"."silver".${source_table}
 GROUP BY
     CAST(created_at AS DATE),
     bank_code,
@@ -322,7 +324,7 @@ GROUP BY
 -- Transform type: aggregate
 -- KPIs theo entity (bank, merchant, etc.)
 
-CREATE OR REPLACE VIEW minio-datalake.gold.bank_performance AS
+CREATE OR REPLACE VIEW "minio-datalake"."gold".bank_performance AS
 SELECT
     t.bank_code,
     b.bank_name,
@@ -352,8 +354,8 @@ SELECT
     SUM(CASE WHEN t.transaction_type = 'PAYMENT'
         THEN 1 ELSE 0 END)                 AS payment_count
 
-FROM minio-datalake.silver.transactions t
-LEFT JOIN minio-datalake.silver.bank_codes b
+FROM "minio-datalake"."silver".transactions t
+LEFT JOIN "minio-datalake"."silver".bank_codes b
     ON t.bank_code = b.bank_code
 GROUP BY t.bank_code, b.bank_name, b.bank_short_name
 ```
@@ -364,7 +366,7 @@ GROUP BY t.bank_code, b.bank_name, b.bank_short_name
 -- Template ID: GOLD_MERCHANT_ANALYTICS
 -- Transform type: aggregate
 
-CREATE OR REPLACE VIEW minio-datalake.gold.merchant_analytics AS
+CREATE OR REPLACE VIEW "minio-datalake"."gold".merchant_analytics AS
 SELECT
     t.merchant_id,
     m.merchant_name,
@@ -379,8 +381,8 @@ SELECT
     CAST(SUM(CASE WHEN t.status_code = '00'
         THEN 1 ELSE 0 END) AS DOUBLE)
         / NULLIF(COUNT(*), 0) * 100        AS success_rate_pct
-FROM minio-datalake.silver.transactions t
-LEFT JOIN minio-datalake.silver.merchants m
+FROM "minio-datalake"."silver".transactions t
+LEFT JOIN "minio-datalake"."silver".merchants m
     ON t.merchant_id = m.merchant_id
 GROUP BY t.merchant_id, m.merchant_name, m.category, m.city
 ```
@@ -392,7 +394,7 @@ GROUP BY t.merchant_id, m.merchant_name, m.category, m.city
 -- Transform type: aggregate
 -- So khớp giao dịch vs quyết toán
 
-CREATE OR REPLACE VIEW minio-datalake.gold.settlement_reconciliation AS
+CREATE OR REPLACE VIEW "minio-datalake"."gold".settlement_reconciliation AS
 SELECT
     s.settlement_id,
     s.bank_code,
@@ -410,18 +412,18 @@ SELECT
         WHEN t.actual_count IS NULL THEN 'NO_TRANSACTIONS'
         ELSE 'MISMATCH'
     END AS recon_status
-FROM minio-datalake.silver.settlements s
+FROM "minio-datalake"."silver".settlements s
 LEFT JOIN (
     SELECT
         bank_code,
         CAST(created_at AS DATE) AS txn_date,
         COUNT(*) AS actual_count,
         SUM(transaction_amount) AS actual_amount
-    FROM minio-datalake.silver.transactions
+    FROM "minio-datalake"."silver".transactions
     WHERE status_code = '00'
     GROUP BY bank_code, CAST(created_at AS DATE)
 ) t ON s.bank_code = t.bank_code AND s.settlement_date = t.txn_date
-LEFT JOIN minio-datalake.silver.bank_codes b ON s.bank_code = b.bank_code
+LEFT JOIN "minio-datalake"."silver".bank_codes b ON s.bank_code = b.bank_code
 ```
 
 ### 4.5 Hourly Trend Analysis
@@ -431,14 +433,14 @@ LEFT JOIN minio-datalake.silver.bank_codes b ON s.bank_code = b.bank_code
 -- Transform type: aggregate
 -- Phân tích xu hướng theo giờ
 
-CREATE OR REPLACE VIEW minio-datalake.gold.hourly_transaction_trend AS
+CREATE OR REPLACE VIEW "minio-datalake"."gold".hourly_transaction_trend AS
 SELECT
     CAST(created_at AS DATE) AS transaction_date,
     EXTRACT(HOUR FROM created_at) AS hour_of_day,
     COUNT(*) AS transaction_count,
     SUM(transaction_amount) AS total_amount,
     AVG(transaction_amount) AS avg_amount
-FROM minio-datalake.silver.transactions
+FROM "minio-datalake"."silver".transactions
 WHERE status_code = '00'
 GROUP BY CAST(created_at AS DATE), EXTRACT(HOUR FROM created_at)
 ORDER BY transaction_date, hour_of_day
@@ -469,7 +471,7 @@ SELECT
         WHEN SUM(CASE WHEN ${column_name} IS NULL THEN 1 ELSE 0 END) = 0 THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio-datalake.${target_layer}.${target_table}
+FROM "minio-datalake"."${target_layer}"."${target_table}"
 ```
 
 ### 5.2 Uniqueness Check
@@ -489,7 +491,7 @@ SELECT
         WHEN COUNT(*) = COUNT(DISTINCT ${column_name}) THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio-datalake.${target_layer}.${target_table}
+FROM "minio-datalake"."${target_layer}"."${target_table}"
 ```
 
 ### 5.3 Range Check
@@ -512,7 +514,7 @@ SELECT
             / NULLIF(COUNT(*), 0) * 100 <= ${threshold_pct} THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio-datalake.${target_layer}.${target_table}
+FROM "minio-datalake"."${target_layer}"."${target_table}"
 ```
 
 ### 5.4 Freshness Check
@@ -532,7 +534,7 @@ SELECT
         WHEN ${rule_expression} THEN 'PASS'
         ELSE 'FAIL'
     END AS result
-FROM minio-datalake.${target_layer}.${target_table}
+FROM "minio-datalake"."${target_layer}"."${target_table}"
 ```
 
 ### 5.5 DQ Summary Query
@@ -554,7 +556,7 @@ SELECT
         WHEN SUM(CASE WHEN status = 'FAIL' THEN 1 ELSE 0 END) = 0 THEN 'ALL_PASSED'
         ELSE 'HAS_FAILURES'
     END AS overall_status
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE layer = 'dq_check'
   AND CAST(start_time AS DATE) = CURRENT_DATE
 GROUP BY pipeline_id, pipeline_name, layer
@@ -573,7 +575,7 @@ SELECT COALESCE(
     MAX(last_watermark),
     '1970-01-01 00:00:00'
 ) AS last_watermark
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'
   AND layer = 'bronze'
   AND status = 'success'
@@ -585,7 +587,7 @@ WHERE pipeline_id = '${pipeline_id}'
 -- Dùng bởi NiFi sau mỗi lần chạy pipeline
 -- Explicit column list (BẮT BUỘC) — không INSERT theo vị trí, tránh vỡ khi schema thêm cột
 
-INSERT INTO minio-datalake.metadata.pipeline_execution_log
+INSERT INTO "minio-datalake"."metadata".pipeline_execution_log
 (execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
  status, rows_processed, rows_inserted, rows_updated, rows_rejected,
  last_watermark, error_message, execution_params, created_at)
@@ -596,7 +598,7 @@ VALUES (
     '${pipeline_name}',
     '${layer}',
     CAST('${start_time}' AS TIMESTAMP),
-    CURRENT_TIMESTAMP,
+    CAST('${now():format('yyyy-MM-dd HH:mm:ss')}' AS TIMESTAMP),
     '${status}',
     ${rows_processed},
     ${rows_inserted},
@@ -608,6 +610,12 @@ VALUES (
     CURRENT_TIMESTAMP
 )
 ```
+
+> **Chỉ dùng MỘT `CURRENT_TIMESTAMP` trong một câu INSERT.** Ở đây `start_time`/`end_time` lấy từ
+> NiFi expression (`CAST('${...}' AS TIMESTAMP)`), chỉ `created_at` dùng `CURRENT_TIMESTAMP` →
+> tránh lỗi Dremio `Duplicate key CURRENT_TIMESTAMP`. Quy tắc chung: nếu cần nhiều cột = thời gian
+> hiện tại trong cùng INSERT, set 1 cột bằng `CURRENT_TIMESTAMP` và các cột còn lại bằng
+> `CAST('${now():format(...)}' AS TIMESTAMP)`; hoặc INSERT trước rồi `UPDATE` sau.
 
 ### 6.3 Build Column List from Mapping
 
@@ -621,7 +629,7 @@ SELECT
     data_type,
     transformation,
     column_order
-FROM minio-datalake.metadata.column_mapping
+FROM "minio-datalake"."metadata".column_mapping
 WHERE pipeline_id = '${pipeline_id}'
 ORDER BY column_order
 ```
@@ -687,10 +695,13 @@ PARTITION BY txn_id, merchant_id
 | `BRONZE_FULL_LOAD`         | full         | bronze        | Full load từ source              |
 | `BRONZE_INCREMENTAL_LOAD`  | incremental  | bronze        | Incremental load bằng watermark  |
 | `BRONZE_PARTITION_OVERWRITE`| full        | bronze        | Overwrite 1 partition            |
-| `SILVER_CREATE_TABLE`      | create_table | silver        | Tạo silver table lần đầu        |
-| `SILVER_DEDUP`             | dedup        | silver        | Loại duplicate                   |
-| `SILVER_MERGE`             | merge        | silver        | Incremental upsert               |
-| `SILVER_MERGE_TRANSFORM`   | merge        | silver        | Upsert + column transforms       |
+| `SILVER_STAGE_LOAD_FULL`   | load_stage   | bronze→staging| Nạp full bronze → staging (cast/clean) |
+| `SILVER_STAGE_LOAD_INCR`   | load_stage   | bronze→staging| Nạp incremental bronze → staging |
+| `SILVER_STAGE_DEDUP`       | dedup        | staging       | Dedup in place trên staging      |
+| `SILVER_ENSURE_TABLE`      | create_table | silver        | Tạo silver nếu chưa có           |
+| `SILVER_MERGE`             | merge        | staging→silver| Incremental upsert từ staging    |
+| `SILVER_FULL_REPLACE`      | merge (full) | staging→silver| Thay toàn bộ silver (full-load)  |
+| `SILVER_CLEANUP`           | custom       | staging       | Drop staging sau khi xong        |
 | `SILVER_FILTER`            | filter       | silver        | Lọc invalid records              |
 | `GOLD_DAILY_SUMMARY`       | aggregate    | gold          | KPI hàng ngày                    |
 | `GOLD_ENTITY_KPIS`         | aggregate    | gold          | KPI theo entity                  |

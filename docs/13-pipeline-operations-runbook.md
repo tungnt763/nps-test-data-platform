@@ -59,13 +59,21 @@ Kết quả phân tích:
 **Bước 2 — INSERT pipeline_config:**
 
 ```sql
-INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
-    'P005',                           -- pipeline_id
-    'ingest_card_types',              -- pipeline_name
+-- INSERT explicit column list, bỏ created_at/updated_at (tránh lỗi Duplicate key CURRENT_TIMESTAMP)
+INSERT INTO "minio-datalake"."metadata".pipeline_config
+(pipeline_id, pipeline_name, dataset, source_type, source_connection, source_schema,
+ source_table, source_layer, target_layer, target_path, target_table, load_type,
+ primary_keys, watermark_column, partition_columns, depends_on, batch_size,
+ schedule_cron, is_active, description)
+VALUES (
+    'BRZ_card_types',                 -- pipeline_id (bronze root stage)
+    'bronze_card_types',              -- pipeline_name
+    'card_types',                     -- dataset
     'jdbc',                           -- source_type
     'source-postgres-pool',           -- source_connection (NiFi CS name)
     'public',                         -- source_schema
     'card_types',                     -- source_table
+    'source',                         -- source_layer (bronze đọc từ source DB)
     'bronze',                         -- target_layer
     'bronze/card_types/dt=${date}',   -- target_path
     'card_types',                     -- target_table
@@ -73,19 +81,28 @@ INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
     'card_type_code',                 -- primary_keys
     NULL,                             -- watermark_column (NULL = full load)
     NULL,                             -- partition_columns
+    NULL,                             -- depends_on (NULL = root → Controller trigger)
     1000,                             -- batch_size
-    '0 4 * * 1',                      -- schedule: 4h sáng mỗi thứ Hai
+    '0 2 * * 1',                      -- schedule_cron (tham khảo; Controller có 1 trigger chung)
     true,                             -- is_active
-    'Weekly full load of card type reference data',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP
+    'Weekly full load of card type reference data'
 );
+
+-- set timestamp thật (ngoài VALUES → không lỗi)
+UPDATE "minio-datalake"."metadata".pipeline_config
+SET created_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+WHERE created_at IS NULL;
 ```
+
+> Onboard đầy đủ cho stage-tách: thêm dòng `SLV_card_types` (silver, `depends_on='BRZ_card_types'`)
+> và trỏ `column_mapping`/`transform_rules`/`data_quality_rules` tới `SLV_card_types` — xem mẫu ở
+> [10-metadata-tables-design.md](10-metadata-tables-design.md) §4.1. Ví dụ Bước 3–6 dưới đây giữ
+> dạng rút gọn để minh họa từng bảng.
 
 **Bước 3 — INSERT column_mapping:**
 
 ```sql
-INSERT INTO minio-datalake.metadata.column_mapping VALUES
+INSERT INTO "minio-datalake"."metadata".column_mapping VALUES
 ('M020', 'P005', 'card_type_code', 'card_type_code', 'VARCHAR', NULL, true, false, NULL, 1, 'PK'),
 ('M021', 'P005', 'card_type_name', 'card_type_name', 'VARCHAR', 'TRIM(${src})', false, false, NULL, 2, 'Name'),
 ('M022', 'P005', 'card_network',   'card_network',   'VARCHAR', 'UPPER(${src})', false, true, '''DOMESTIC''', 3, 'VISA/MC/NAPAS'),
@@ -95,13 +112,13 @@ INSERT INTO minio-datalake.metadata.column_mapping VALUES
 **Bước 4 — INSERT transform_rules (silver):**
 
 ```sql
-INSERT INTO minio-datalake.metadata.transform_rules VALUES (
+INSERT INTO "minio-datalake"."metadata".transform_rules VALUES (
     'T010', 'P005', 'create_silver_card_types',
     'bronze', 'silver', 'create_table',
-    'CREATE OR REPLACE TABLE minio-datalake.silver.card_types AS
+    'CREATE OR REPLACE TABLE "minio-datalake"."silver".card_types AS
      SELECT * FROM (
        SELECT *, ROW_NUMBER() OVER (PARTITION BY card_type_code ORDER BY card_type_code) AS rn
-       FROM minio-datalake.bronze.card_types
+       FROM "minio-datalake"."bronze".card_types
      ) WHERE rn = 1',
     NULL, 1, true,
     'Create/replace silver card_types from bronze'
@@ -113,7 +130,7 @@ INSERT INTO minio-datalake.metadata.transform_rules VALUES (
 **Bước 6 — INSERT DQ rules:**
 
 ```sql
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES
+INSERT INTO "minio-datalake"."metadata".data_quality_rules VALUES
 ('DQ010', 'P005', 'silver', 'card_types', 'card_type_code', 'not_null',
  '${column} IS NOT NULL', 'critical', 0.0, true, 'PK must not be null'),
 ('DQ011', 'P005', 'silver', 'card_types', 'card_type_code', 'unique',
@@ -125,13 +142,13 @@ INSERT INTO minio-datalake.metadata.data_quality_rules VALUES
 **Bước 8 — Verify:**
 ```sql
 -- Check bronze data
-SELECT COUNT(*) FROM minio-datalake.bronze.card_types;
+SELECT COUNT(*) FROM "minio-datalake"."bronze".card_types;
 
 -- Check silver data
-SELECT COUNT(*) FROM minio-datalake.silver.card_types;
+SELECT COUNT(*) FROM "minio-datalake"."silver".card_types;
 
 -- Check execution log
-SELECT * FROM minio-datalake.metadata.pipeline_execution_log
+SELECT * FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = 'P005'
 ORDER BY start_time DESC
 LIMIT 5;
@@ -161,17 +178,17 @@ LIMIT 5;
 
 ```sql
 -- Tạm tắt 1 pipeline
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET is_active = false, updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P001';
 
 -- Bật lại
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET is_active = true, updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P001';
 
 -- Tắt tất cả (maintenance mode)
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET is_active = false, updated_at = CURRENT_TIMESTAMP;
 ```
 
@@ -180,47 +197,49 @@ SET is_active = false, updated_at = CURRENT_TIMESTAMP;
 Chuyển từ full → incremental (khi bảng đã lớn):
 
 ```sql
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET
     load_type = 'incremental',
     watermark_column = 'updated_at',
     updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P002';
 
--- Seed initial watermark (explicit column list — không INSERT theo vị trí)
-INSERT INTO minio-datalake.metadata.pipeline_execution_log
-(execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
+-- Seed initial watermark — INSERT bỏ start_time/end_time/created_at, set bằng UPDATE sau
+INSERT INTO "minio-datalake"."metadata".pipeline_execution_log
+(execution_id, run_id, pipeline_id, pipeline_name, layer,
  status, rows_processed, rows_inserted, rows_updated, rows_rejected,
- last_watermark, error_message, execution_params, created_at)
+ last_watermark, error_message, execution_params)
 VALUES (
     'P002_SEED',
     'SEED',
     'P002',
     'ingest_merchants',
     'bronze',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP,
     'success',
     0, 0, 0, 0,
     '2026-06-01 00:00:00',  -- Last watermark = start date
     NULL,
-    'seed',
-    CURRENT_TIMESTAMP
+    'seed'
 );
+
+-- set timestamp thật (ngoài VALUES → tránh Duplicate key CURRENT_TIMESTAMP)
+UPDATE "minio-datalake"."metadata".pipeline_execution_log
+SET start_time = CURRENT_TIMESTAMP, end_time = CURRENT_TIMESTAMP, created_at = CURRENT_TIMESTAMP
+WHERE execution_id = 'P002_SEED';
 ```
 
 ### 2.3 Thêm/Sửa Column
 
 ```sql
 -- Thêm column mới
-INSERT INTO minio-datalake.metadata.column_mapping VALUES (
+INSERT INTO "minio-datalake"."metadata".column_mapping VALUES (
     'M030', 'P001', 'channel',  'payment_channel', 'VARCHAR',
     'UPPER(TRIM(${src}))', false, true, '''UNKNOWN''', 10,
     'Payment channel: POS, ECOM, QR, ATM'
 );
 
 -- Sửa transformation
-UPDATE minio-datalake.metadata.column_mapping
+UPDATE "minio-datalake"."metadata".column_mapping
 SET transformation = 'COALESCE(CAST(${src} AS DECIMAL(18,2)), 0)'
 WHERE mapping_id = 'M002';
 ```
@@ -229,21 +248,21 @@ WHERE mapping_id = 'M002';
 
 ```sql
 -- 1. Xóa execution history
-DELETE FROM minio-datalake.metadata.pipeline_execution_log
+DELETE FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = 'P001';
 
 -- 2. Drop silver table (nếu cần recreate)
-DROP TABLE IF EXISTS minio-datalake.silver.transactions;
+DROP TABLE IF EXISTS "minio-datalake"."silver".transactions;
 
 -- 3. Chuyển tạm về full load để recreate
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET load_type = 'full', updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P001';
 
 -- 4. Trigger manual run
 
 -- 5. Sau khi xong, chuyển lại incremental
-UPDATE minio-datalake.metadata.pipeline_config
+UPDATE "minio-datalake"."metadata".pipeline_config
 SET load_type = 'incremental', updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P001';
 ```
@@ -268,7 +287,7 @@ SELECT
     e.last_rows,
     e.total_runs_today,
     e.failed_runs_today
-FROM minio-datalake.metadata.pipeline_config p
+FROM "minio-datalake"."metadata".pipeline_config p
 LEFT JOIN (
     SELECT
         pipeline_id,
@@ -277,9 +296,9 @@ LEFT JOIN (
         MAX(CASE WHEN start_time = sub.max_time THEN rows_processed END) AS last_rows,
         COUNT(CASE WHEN CAST(start_time AS DATE) = CURRENT_DATE THEN 1 END) AS total_runs_today,
         COUNT(CASE WHEN CAST(start_time AS DATE) = CURRENT_DATE AND status = 'failed' THEN 1 END) AS failed_runs_today
-    FROM minio-datalake.metadata.pipeline_execution_log,
+    FROM "minio-datalake"."metadata".pipeline_execution_log,
          (SELECT pipeline_id AS pid, MAX(start_time) AS max_time
-          FROM minio-datalake.metadata.pipeline_execution_log
+          FROM "minio-datalake"."metadata".pipeline_execution_log
           GROUP BY pipeline_id) sub
     WHERE pipeline_id = sub.pid
     GROUP BY pipeline_id
@@ -297,7 +316,7 @@ SELECT
     start_time,
     end_time,
     error_message
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE status = 'failed'
   AND CAST(start_time AS DATE) >= CURRENT_DATE - INTERVAL '7' DAY
 ORDER BY start_time DESC;
@@ -316,13 +335,13 @@ SELECT
         WHEN e.last_success_time >= CURRENT_TIMESTAMP - INTERVAL '3' DAY THEN 'STALE'
         ELSE 'CRITICAL'
     END AS freshness_status
-FROM minio-datalake.metadata.pipeline_config p
+FROM "minio-datalake"."metadata".pipeline_config p
 LEFT JOIN (
     SELECT
         pipeline_id,
         MAX(end_time) AS last_success_time,
         MAX(last_watermark) AS last_watermark
-    FROM minio-datalake.metadata.pipeline_execution_log
+    FROM "minio-datalake"."metadata".pipeline_execution_log
     WHERE status = 'success' AND layer = 'bronze'
     GROUP BY pipeline_id
 ) e ON p.pipeline_id = e.pipeline_id
@@ -340,7 +359,7 @@ SELECT
     COUNT(*) AS run_count,
     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE start_time >= CURRENT_TIMESTAMP - INTERVAL '30' DAY
 GROUP BY CAST(start_time AS DATE), pipeline_name
 ORDER BY run_date DESC, pipeline_name;
@@ -452,8 +471,8 @@ Tạo snapshot metadata tables định kỳ:
 
 ```sql
 -- Backup pipeline_config
-CREATE TABLE minio-datalake.metadata.pipeline_config_backup_20260624 AS
-SELECT * FROM minio-datalake.metadata.pipeline_config;
+CREATE TABLE "minio-datalake"."metadata".pipeline_config_backup_20260624 AS
+SELECT * FROM "minio-datalake"."metadata".pipeline_config;
 
 -- Hoặc export ra JSON qua NiFi:
 -- ExecuteSQL → ConvertAvroToJSON → PutS3Object
@@ -464,8 +483,8 @@ SELECT * FROM minio-datalake.metadata.pipeline_config;
 
 ```sql
 -- Restore từ backup
-CREATE OR REPLACE TABLE minio-datalake.metadata.pipeline_config AS
-SELECT * FROM minio-datalake.metadata.pipeline_config_backup_20260624;
+CREATE OR REPLACE TABLE "minio-datalake"."metadata".pipeline_config AS
+SELECT * FROM "minio-datalake"."metadata".pipeline_config_backup_20260624;
 ```
 
 ### 5.3 NiFi Flow Backup
@@ -562,19 +581,19 @@ kubectl port-forward -n data-visualization svc/superset-postgresql 5433:5432
 
 ```sql
 -- Liệt kê tất cả pipeline
-SELECT pipeline_id, pipeline_name, load_type, is_active FROM minio-datalake.metadata.pipeline_config;
+SELECT pipeline_id, pipeline_name, load_type, is_active FROM "minio-datalake"."metadata".pipeline_config;
 
 -- Last 10 executions
 SELECT pipeline_name, layer, status, rows_processed, start_time
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 ORDER BY start_time DESC LIMIT 10;
 
 -- Pipeline chưa chạy hôm nay
 SELECT p.pipeline_id, p.pipeline_name
-FROM minio-datalake.metadata.pipeline_config p
+FROM "minio-datalake"."metadata".pipeline_config p
 WHERE p.is_active = true
   AND p.pipeline_id NOT IN (
-    SELECT DISTINCT pipeline_id FROM minio-datalake.metadata.pipeline_execution_log
+    SELECT DISTINCT pipeline_id FROM "minio-datalake"."metadata".pipeline_execution_log
     WHERE CAST(start_time AS DATE) = CURRENT_DATE AND status = 'success'
   );
 ```

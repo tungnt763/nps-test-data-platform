@@ -210,7 +210,7 @@ chúng được Resolve Next đánh thức.
 
 ```sql
 SELECT pipeline_id, target_layer
-FROM minio-datalake.metadata.pipeline_config
+FROM "minio-datalake"."metadata".pipeline_config
 WHERE is_active = true
   AND depends_on IS NULL
 ORDER BY pipeline_id
@@ -297,7 +297,7 @@ Mỗi stage TỰ nạp config của chính nó từ `next_pipeline_id` (không k
 SELECT pipeline_id, pipeline_name, source_connection, source_schema, source_table,
        load_type, primary_keys, watermark_column, partition_columns,
        target_layer, target_path, target_table, batch_size
-FROM minio-datalake.metadata.pipeline_config
+FROM "minio-datalake"."metadata".pipeline_config
 WHERE pipeline_id = '${next_pipeline_id}'
   AND is_active = true
 ```
@@ -352,7 +352,7 @@ Destination = `flowfile-attribute`) với các property:
 
 ```sql
 SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'
   AND layer = 'bronze'
   AND status = 'success'
@@ -406,7 +406,7 @@ WHERE pipeline_id = '${pipeline_id}'
 **ReplaceText (`Build Execution Log SQL`):** Search `(?s)(^.*$)`, Strategy `Regex Replace`, Entire text. Replacement Value:
 
 ```
-INSERT INTO minio-datalake.metadata.pipeline_execution_log
+INSERT INTO "minio-datalake"."metadata".pipeline_execution_log
 (execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
  status, rows_processed, rows_inserted, rows_updated, rows_rejected,
  last_watermark, error_message, execution_params, created_at)
@@ -454,7 +454,7 @@ Giống §6.1 nhưng dùng cho silver — nạp config **của chính silver** (
 ```sql
 SELECT pipeline_id, pipeline_name, source_layer, source_table, target_table,
        load_type, primary_keys, watermark_column, partition_columns
-FROM minio-datalake.metadata.pipeline_config
+FROM "minio-datalake"."metadata".pipeline_config
 WHERE pipeline_id = '${next_pipeline_id}'   -- vd 'SLV_transactions'
   AND is_active = true
 ```
@@ -470,7 +470,7 @@ Khóa theo **pipeline_id của stage này** — lấy đúng rules của silver,
 
 ```sql
 SELECT r.rule_id, r.rule_name, r.transform_type, r.sql_template, r.execution_order
-FROM minio-datalake.metadata.transform_rules r
+FROM "minio-datalake"."metadata".transform_rules r
 WHERE r.pipeline_id = '${pipeline_id}'   -- = SLV_*
   AND r.is_active = true
 ORDER BY r.execution_order
@@ -480,7 +480,16 @@ ORDER BY r.execution_order
 `EvaluateJsonPath` (`Extract Rule`: `rule_id`, `rule_name`, `transform_type`, `sql_template`).
 
 > SplitJson giữ nguyên attribute cha (`run_id`, `pipeline_id`, `target_table`...) cho mỗi rule.
-> Nhiều rule (create_table → dedup → merge) chạy tuần tự theo `execution_order`.
+>
+> ⚠️ **BẮT BUỘC chạy tuần tự đúng `execution_order`.** Silver dùng **pattern staging**:
+> `load_stage` (bronze→staging) → `dedup` (trên staging) → `create_table` (ensure silver) →
+> `merge` (staging→silver). Các bước phụ thuộc nhau nên KHÔNG được chạy song song/đảo thứ tự.
+> Cấu hình để đảm bảo:
+> - `Render Transform SQL` và `Run Transform on Dremio`: **Concurrent Tasks = 1**.
+> - Connection sau `Split Per Rule`: dùng prioritizer **FirstInFirstOutPrioritizer**.
+> - SplitJson phát fragment theo đúng thứ tự kết quả (đã `ORDER BY execution_order`).
+>
+> Xem SQL từng bước ở [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3 (Staging Pattern).
 
 ### 7.3 Incremental: Get Silver Watermark (nếu load_type = incremental)
 
@@ -488,7 +497,7 @@ Giống bronze nhưng keyed theo **pipeline_id silver + layer='silver'**:
 
 ```sql
 SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'   -- SLV_*
   AND layer = 'silver'
   AND status = 'success'
@@ -507,8 +516,12 @@ WHERE pipeline_id = '${pipeline_id}'   -- SLV_*
 | **Evaluation Mode** | `Entire text` |
 
 > `${sql_template}` chứa SQL trong metadata; các biến `${source_table}`, `${target_table}`,
-> `${primary_keys}`, `${watermark_column}`, `${last_watermark}` được Expression Language resolve
-> vì chúng đều là attribute (từ Load Own Config + Get Silver Watermark). Chi tiết template: Doc 12.
+> `${primary_keys}`, `${watermark_column}`, `${last_watermark}`, `${column_select_list}`,
+> `${merge_on_clause}` được Expression Language resolve vì chúng đều là attribute (từ Load Own
+> Config + Get Silver Watermark + build từ column_mapping/primary_keys). Chi tiết template: Doc 12 §3.
+>
+> Template ghi vào **staging** trước, chỉ bước `merge` mới chạm bảng silver chính → silver không
+> bao giờ ở trạng thái dang dở. (Tùy chọn) thêm rule `SILVER_CLEANUP` cuối cùng để drop staging.
 
 ### 7.5 Processor: ExecuteSQL (Run Transform on Dremio)
 
@@ -557,7 +570,7 @@ Root canvas → Add PG → `[6] Resolve Next Stages`. Kéo connection từ **c�
 
 ```sql
 SELECT pipeline_id AS next_pipeline_id, target_layer
-FROM minio-datalake.metadata.pipeline_config
+FROM "minio-datalake"."metadata".pipeline_config
 WHERE is_active = true
   AND ( depends_on = '${pipeline_id}'
         OR depends_on LIKE '${pipeline_id},%'

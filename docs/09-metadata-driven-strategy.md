@@ -117,6 +117,7 @@ Metadata-Driven Pipeline:
 ║  │  │   ├── transactions/dt=2026-06-24/                              │ ║
 ║  │  │   ├── merchants/dt=2026-06-24/                                 │ ║
 ║  │  │   └── settlements/dt=2026-06-24/                               │ ║
+║  │  ├── staging/           ← Temp tables (bronze→silver, transient)  │ ║
 ║  │  ├── silver/            ← Cleaned Iceberg (Dremio transforms)     │ ║
 ║  │  │   ├── transactions/                                            │ ║
 ║  │  │   ├── merchants/                                               │ ║

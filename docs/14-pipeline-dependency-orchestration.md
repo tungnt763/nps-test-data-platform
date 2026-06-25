@@ -179,7 +179,7 @@ Stage tiếp theo **tự re-query** `pipeline_config WHERE pipeline_id = next_pi
 
 ```sql
 -- Controller đọc các ROOT stage để khởi động luồng
-SELECT * FROM minio-datalake.metadata.pipeline_config
+SELECT * FROM "minio-datalake"."metadata".pipeline_config
 WHERE is_active = true
   AND depends_on IS NULL          -- chỉ root (bronze ingestion)
 ORDER BY pipeline_id
@@ -197,7 +197,7 @@ SELECT
     pipeline_id        AS next_pipeline_id,
     target_layer,
     depends_on
-FROM minio-datalake.metadata.pipeline_config
+FROM "minio-datalake"."metadata".pipeline_config
 WHERE is_active = true
   AND ( depends_on = '${pipeline_id}'
         OR depends_on LIKE '${pipeline_id},%'
@@ -211,7 +211,7 @@ WHERE is_active = true
 
 ### 4.5 Sequencing of multiple transform_rules trong 1 stage
 
-Trong **một** stage silver có thể có nhiều rule (create_table → dedup → merge). Thứ tự nội bộ vẫn dùng `transform_rules.execution_order` + `transform_rules.depends_on` (đã có sẵn ở Doc 10 §3.3). NiFi đọc rules `ORDER BY execution_order` và execute tuần tự **trong** stage; chỉ khi **toàn bộ rules** của stage success thì mới "Resolve Next" sang gold.
+Trong **một** stage silver có nhiều rule theo **pattern staging**: `load_stage` (bronze→staging) → `dedup` (trên staging) → `create_table` (ensure silver) → `merge` (staging→silver). Thứ tự nội bộ dùng `transform_rules.execution_order` + `depends_on` (Doc 10 §3.3, §4.3; SQL ở Doc 12 §3). NiFi đọc rules `ORDER BY execution_order` và execute **tuần tự, không song song** (vì các bước phụ thuộc nhau — Doc 11 §7.2); chỉ khi **toàn bộ rules** của stage success thì mới "Resolve Next" sang gold.
 
 ### 4.6 Watermark là per-stage (độc lập hoàn toàn)
 
@@ -220,7 +220,7 @@ Silver incremental đọc bronze:
 ```sql
 -- last_watermark CỦA SILVER, không phải của bronze
 SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE pipeline_id = '${pipeline_id}'   -- = 'SLV_transactions'
   AND layer = 'silver'
   AND status = 'success'
@@ -299,7 +299,7 @@ GLD_bank_kpis FlowFile ──▶ Wait(signal = ${run_id}:GLD_bank_kpis,
 ```sql
 -- Trả về số parent đã success cho run_id hiện tại
 SELECT COUNT(DISTINCT pipeline_id) AS ready_parents
-FROM minio-datalake.metadata.pipeline_execution_log
+FROM "minio-datalake"."metadata".pipeline_execution_log
 WHERE run_id = '${run_id}'
   AND status = 'success'
   AND pipeline_id IN ( <expand depends_on thành danh sách quoted> )
