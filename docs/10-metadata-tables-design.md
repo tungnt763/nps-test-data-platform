@@ -77,10 +77,12 @@ Chạy các câu SQL sau trong **Dremio SQL Runner** (hoặc NiFi gọi qua JDBC
 CREATE TABLE minio-datalake.metadata.pipeline_config (
     pipeline_id         VARCHAR,
     pipeline_name       VARCHAR,
+    dataset             VARCHAR,
     source_type         VARCHAR,
     source_connection   VARCHAR,
     source_schema       VARCHAR,
     source_table        VARCHAR,
+    source_layer        VARCHAR,
     target_layer        VARCHAR,
     target_path         VARCHAR,
     target_table        VARCHAR,
@@ -88,6 +90,7 @@ CREATE TABLE minio-datalake.metadata.pipeline_config (
     primary_keys        VARCHAR,
     watermark_column    VARCHAR,
     partition_columns   VARCHAR,
+    depends_on          VARCHAR,
     batch_size          INT,
     schedule_cron       VARCHAR,
     is_active           BOOLEAN,
@@ -97,16 +100,25 @@ CREATE TABLE minio-datalake.metadata.pipeline_config (
 );
 ```
 
+> **QUAN TRỌNG — Mô hình "1 stage = 1 config row":** Mỗi bước chuyển tầng
+> (`source→bronze`, `bronze→silver`, `silver→gold`) là **một dòng riêng** với
+> `pipeline_id` riêng (vd `BRZ_transactions`, `SLV_transactions`, `GLD_daily_txn`).
+> `load_type`/`primary_keys`/`watermark_column`/`partition_columns` trên dòng `SLV_*`
+> mô tả cách **silver đọc bronze** — độc lập hoàn toàn với cách bronze đọc source.
+> Quan hệ phụ thuộc khai báo qua `depends_on`. Xem [14-pipeline-dependency-orchestration.md](14-pipeline-dependency-orchestration.md).
+
 **Giải thích từng field:**
 
 | Field              | Kiểu     | Mô tả                                                         | Ví dụ                                              |
 |--------------------|----------|----------------------------------------------------------------|-----------------------------------------------------|
-| `pipeline_id`      | VARCHAR  | ID duy nhất cho pipeline                                       | `P001`                                              |
+| `pipeline_id`      | VARCHAR  | ID duy nhất cho **stage** (mỗi layer-transition 1 id riêng)    | `BRZ_transactions`, `SLV_transactions`             |
 | `pipeline_name`    | VARCHAR  | Tên mô tả                                                     | `ingest_transactions`                               |
+| `dataset`          | VARCHAR  | Nhóm logic các stage của cùng thực thể                         | `transactions`                                      |
 | `source_type`      | VARCHAR  | Loại nguồn dữ liệu                                           | `jdbc`, `api`, `sftp`, `file`                       |
 | `source_connection`| VARCHAR  | Tên Controller Service JDBC trong NiFi (hoặc URL)             | `source-postgres-pool`                              |
-| `source_schema`    | VARCHAR  | Schema của source DB                                           | `public`                                            |
-| `source_table`     | VARCHAR  | Tên bảng nguồn                                                | `transactions`                                      |
+| `source_schema`    | VARCHAR  | Schema của source DB (chỉ áp dụng bronze)                     | `public`                                            |
+| `source_table`     | VARCHAR  | Bảng nguồn (silver/gold: tên bảng ở tầng `source_layer`)      | `transactions`                                      |
+| `source_layer`     | VARCHAR  | Tầng nguồn của stage này                                       | `source` (bronze), `bronze` (silver), `silver` (gold) |
 | `target_layer`     | VARCHAR  | Layer đích                                                     | `bronze`, `silver`, `gold`                          |
 | `target_path`      | VARCHAR  | S3 path pattern (NiFi Expression Language)                     | `bronze/${source_table}/dt=${date}`                  |
 | `target_table`     | VARCHAR  | Tên bảng đích trong Dremio                                    | `transactions`                                      |
@@ -114,6 +126,7 @@ CREATE TABLE minio-datalake.metadata.pipeline_config (
 | `primary_keys`     | VARCHAR  | Khóa chính (comma-separated)                                  | `txn_id` hoặc `txn_id,merchant_id`                  |
 | `watermark_column` | VARCHAR  | Cột dùng cho incremental load (NULL nếu full load)            | `updated_at`                                        |
 | `partition_columns`| VARCHAR  | Cột partition (comma-separated, NULL nếu không partition)      | `transaction_date`                                  |
+| `depends_on`       | VARCHAR  | `pipeline_id` upstream (comma-separated). `NULL` = root/ingestion. Định nghĩa cạnh DAG | `BRZ_transactions` hoặc `SLV_txn,SLV_merchants` |
 | `batch_size`       | INT      | Số rows mỗi batch (NiFi fetch size)                           | `10000`                                             |
 | `schedule_cron`    | VARCHAR  | Lịch chạy                                                     | `0 2 * * *` (2h sáng mỗi ngày)                     |
 | `is_active`        | BOOLEAN  | Pipeline có đang active không                                  | `true`, `false`                                     |
@@ -146,7 +159,7 @@ CREATE TABLE minio-datalake.metadata.column_mapping (
 | Field            | Mô tả                                                       | Ví dụ                                   |
 |------------------|--------------------------------------------------------------|------------------------------------------|
 | `mapping_id`     | ID duy nhất                                                  | `M001`                                   |
-| `pipeline_id`    | FK → pipeline_config                                         | `P001`                                   |
+| `pipeline_id`    | FK → pipeline_config (**stage sở hữu transform**, thường là silver) | `SLV_transactions`               |
 | `source_column`  | Tên cột trong source DB                                      | `TXN_AMOUNT`                             |
 | `target_column`  | Tên cột trong target table                                   | `transaction_amount`                     |
 | `data_type`      | Kiểu dữ liệu target                                         | `DECIMAL(18,2)`, `VARCHAR`, `TIMESTAMP`  |
@@ -188,7 +201,7 @@ CREATE TABLE minio-datalake.metadata.transform_rules (
 | Field             | Mô tả                                                       | Ví dụ                                   |
 |-------------------|--------------------------------------------------------------|------------------------------------------|
 | `rule_id`         | ID duy nhất                                                  | `T001`                                   |
-| `pipeline_id`     | FK → pipeline_config                                         | `P001`                                   |
+| `pipeline_id`     | FK → pipeline_config (**stage sở hữu rule**: silver/gold)    | `SLV_transactions`, `GLD_daily_txn`      |
 | `rule_name`       | Tên rule                                                     | `dedup_transactions`                     |
 | `source_layer`    | Layer nguồn                                                  | `bronze`, `silver`                       |
 | `target_layer`    | Layer đích                                                   | `silver`, `gold`                         |
@@ -234,7 +247,7 @@ CREATE TABLE minio-datalake.metadata.data_quality_rules (
 | Field              | Kiểu     | Mô tả                                                         | Ví dụ                                              |
 |--------------------|----------|----------------------------------------------------------------|-----------------------------------------------------|
 | `dq_rule_id`       | VARCHAR  | ID duy nhất cho DQ rule                                        | `DQ001`                                             |
-| `pipeline_id`      | VARCHAR  | FK → pipeline_config, rule thuộc pipeline nào                  | `P001`                                              |
+| `pipeline_id`      | VARCHAR  | FK → pipeline_config (**stage sở hữu**, thường silver)         | `SLV_transactions`                                  |
 | `target_layer`     | VARCHAR  | Layer cần check (sau transform)                                | `silver`, `gold`                                    |
 | `target_table`     | VARCHAR  | Bảng cần check                                                 | `transactions`                                      |
 | `column_name`      | VARCHAR  | Cột cần kiểm tra                                               | `txn_id`, `transaction_amount`, `bank_code`         |
@@ -273,6 +286,7 @@ CREATE TABLE minio-datalake.metadata.data_quality_rules (
 ```sql
 CREATE TABLE minio-datalake.metadata.pipeline_execution_log (
     execution_id        VARCHAR,
+    run_id              VARCHAR,
     pipeline_id         VARCHAR,
     pipeline_name       VARCHAR,
     layer               VARCHAR,
@@ -294,8 +308,9 @@ CREATE TABLE minio-datalake.metadata.pipeline_execution_log (
 
 | Field              | Kiểu      | Mô tả                                                         | Ví dụ                                              |
 |--------------------|-----------|----------------------------------------------------------------|-----------------------------------------------------|
-| `execution_id`     | VARCHAR   | ID duy nhất cho mỗi lần chạy                                   | `P001_20260624_020000`                              |
-| `pipeline_id`      | VARCHAR   | FK → pipeline_config, pipeline nào đã chạy                     | `P001`                                              |
+| `execution_id`     | VARCHAR   | ID duy nhất cho mỗi lần chạy (mỗi stage)                       | `SLV_transactions_20260625_021800`                 |
+| `run_id`           | VARCHAR   | Khóa tương quan **xuyên suốt 1 lần trigger** (chung cho cả bronze→silver→gold). Dùng cho lineage, guard, Wait/Notify | `RUN_20260625_020000_a1b2` |
+| `pipeline_id`      | VARCHAR   | FK → pipeline_config, **stage** nào đã chạy                    | `BRZ_transactions`, `SLV_transactions`             |
 | `pipeline_name`    | VARCHAR   | Tên pipeline (denormalized, tiện query)                        | `ingest_transactions`                               |
 | `layer`            | VARCHAR   | Layer đã xử lý trong lần chạy này                              | `bronze`, `silver`, `gold`, `dq_check`              |
 | `start_time`       | TIMESTAMP | Thời gian bắt đầu chạy                                        | `2026-06-24 02:00:00`                               |
@@ -324,124 +339,107 @@ CREATE TABLE minio-datalake.metadata.pipeline_execution_log (
 
 ## 4. Sample Data — Demo Pipeline
 
-### 4.1 Pipeline Config cho demo
+### 4.1 Pipeline Config cho demo (mô hình stage-tách)
+
+> **Mỗi layer-transition = 1 dòng** với `pipeline_id` riêng + `depends_on`. Root (bronze ingestion)
+> có `depends_on = NULL`. Dùng **explicit column list** (BẮT BUỘC) — không INSERT theo vị trí,
+> để không vỡ khi schema thêm cột. Các cột không liệt kê sẽ nhận `NULL`.
 
 ```sql
--- Pipeline 1: Ingest transactions (incremental)
-INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
-    'P001',
-    'ingest_transactions',
-    'jdbc',
-    'source-postgres-pool',
-    'public',
-    'transactions',
-    'bronze',
-    'bronze/transactions/dt=${date}',
-    'transactions',
-    'incremental',
-    'txn_id',
-    'created_at',
-    'transaction_date',
-    10000,
-    '0 2 * * *',
-    true,
-    'Daily incremental ingest of transactions from core banking PostgreSQL',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP
-);
+INSERT INTO minio-datalake.metadata.pipeline_config
+(pipeline_id, pipeline_name, dataset, source_type, source_connection, source_schema,
+ source_table, source_layer, target_layer, target_table, load_type, primary_keys,
+ watermark_column, partition_columns, depends_on, batch_size, schedule_cron,
+ is_active, description, created_at, updated_at)
+VALUES
+-- ===== ROOT STAGES: source → bronze (depends_on = NULL, được Controller trigger) =====
+('BRZ_transactions','bronze_transactions','transactions','jdbc','source-postgres-pool','public',
+ 'transactions','source','bronze','transactions','incremental','txn_id','created_at','transaction_date',
+ NULL, 10000,'0 2 * * *', true,'Incremental ingest transactions từ source', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
 
--- Pipeline 2: Ingest merchants (full load, bảng nhỏ)
-INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
-    'P002',
-    'ingest_merchants',
-    'jdbc',
-    'source-postgres-pool',
-    'public',
-    'merchants',
-    'bronze',
-    'bronze/merchants/dt=${date}',
-    'merchants',
-    'full',
-    'merchant_id',
-    NULL,
-    NULL,
-    5000,
-    '0 3 * * *',
-    true,
-    'Daily full load of merchant master data',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP
-);
+('BRZ_merchants','bronze_merchants','merchants','jdbc','source-postgres-pool','public',
+ 'merchants','source','bronze','merchants','full','merchant_id',NULL,NULL,
+ NULL, 5000,'0 2 * * *', true,'Full load merchant master', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
 
--- Pipeline 3: Ingest bank_codes (full load, reference data)
-INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
-    'P003',
-    'ingest_bank_codes',
-    'jdbc',
-    'source-postgres-pool',
-    'public',
-    'bank_codes',
-    'bronze',
-    'bronze/bank_codes/dt=${date}',
-    'bank_codes',
-    'full',
-    'bank_code',
-    NULL,
-    NULL,
-    1000,
-    '0 4 * * 1',
-    true,
-    'Weekly full load of bank reference codes',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP
-);
+('BRZ_bank_codes','bronze_bank_codes','bank_codes','jdbc','source-postgres-pool','public',
+ 'bank_codes','source','bronze','bank_codes','full','bank_code',NULL,NULL,
+ NULL, 1000,'0 2 * * 1', true,'Weekly full load bank reference', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
 
--- Pipeline 4: Ingest settlements (incremental)
-INSERT INTO minio-datalake.metadata.pipeline_config VALUES (
-    'P004',
-    'ingest_settlements',
-    'jdbc',
-    'source-postgres-pool',
-    'public',
-    'settlements',
-    'bronze',
-    'bronze/settlements/dt=${date}',
-    'settlements',
-    'incremental',
-    'settlement_id',
-    'settlement_date',
-    'settlement_date',
-    10000,
-    '0 5 * * *',
-    true,
-    'Daily incremental ingest of settlement records',
-    CURRENT_TIMESTAMP,
-    CURRENT_TIMESTAMP
-);
+('BRZ_settlements','bronze_settlements','settlements','jdbc','source-postgres-pool','public',
+ 'settlements','source','bronze','settlements','incremental','settlement_id','settlement_date','settlement_date',
+ NULL, 10000,'0 2 * * *', true,'Incremental ingest settlements', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+-- ===== SILVER STAGES: bronze → silver (config ĐỘC LẬP với bronze; depends_on = BRZ_*) =====
+('SLV_transactions','silver_transactions','transactions','internal',NULL,NULL,
+ 'transactions','bronze','silver','transactions','incremental','txn_id','created_at',NULL,
+ 'BRZ_transactions', NULL,NULL, true,'Dedup + merge transactions bronze→silver', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+('SLV_merchants','silver_merchants','merchants','internal',NULL,NULL,
+ 'merchants','bronze','silver','merchants','full','merchant_id',NULL,NULL,
+ 'BRZ_merchants', NULL,NULL, true,'Dedup merchants bronze→silver', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+('SLV_bank_codes','silver_bank_codes','bank_codes','internal',NULL,NULL,
+ 'bank_codes','bronze','silver','bank_codes','full','bank_code',NULL,NULL,
+ 'BRZ_bank_codes', NULL,NULL, true,'Dedup bank_codes bronze→silver', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+('SLV_settlements','silver_settlements','settlements','internal',NULL,NULL,
+ 'settlements','bronze','silver','settlements','incremental','settlement_id','settlement_date',NULL,
+ 'BRZ_settlements', NULL,NULL, true,'Merge settlements bronze→silver', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+-- ===== GOLD STAGES: silver → gold (depends_on = SLV_*; GLD_bank_kpis là fan-in 2 parent) =====
+('GLD_daily_txn','gold_daily_txn_summary','transactions','internal',NULL,NULL,
+ 'transactions','silver','gold','daily_transaction_summary','full',NULL,NULL,NULL,
+ 'SLV_transactions', NULL,NULL, true,'Daily aggregated KPIs', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+
+('GLD_bank_kpis','gold_bank_performance','transactions','internal',NULL,NULL,
+ 'transactions','silver','gold','bank_performance_kpis','full',NULL,NULL,NULL,
+ 'SLV_transactions,SLV_merchants',   -- FAN-IN: 2 parent → executor dùng Wait/Notify (Doc 11 §10)
+ NULL,NULL, true,'Bank KPIs join transactions + merchants', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 ```
+
+> **DAG sinh ra từ `depends_on`:**
+> ```
+> BRZ_transactions → SLV_transactions ─┬→ GLD_daily_txn
+> BRZ_merchants    → SLV_merchants ────┴→ GLD_bank_kpis   (⟵ 2 parent)
+> BRZ_bank_codes   → SLV_bank_codes
+> BRZ_settlements  → SLV_settlements
+> ```
 
 ### 4.2 Column Mapping cho transactions
 
+> `pipeline_id` của column_mapping **trỏ tới stage sở hữu transform** — các phép CAST/TRIM/UPPER
+> này áp dụng khi bronze→silver, nên thuộc `SLV_transactions` (không phải bronze).
+
 ```sql
--- Transactions column mappings
-INSERT INTO minio-datalake.metadata.column_mapping VALUES
-('M001', 'P001', 'txn_id',           'txn_id',              'VARCHAR',        NULL,                                    true,  false, NULL, 1, 'Primary key'),
-('M002', 'P001', 'amount',           'transaction_amount',  'DECIMAL(18,2)',  'CAST(${src} AS DECIMAL(18,2))',         false, false, NULL, 2, 'Transaction amount'),
-('M003', 'P001', 'currency',         'currency_code',       'VARCHAR',        'UPPER(TRIM(${src}))',                   false, false, '''VND''', 3, 'ISO currency code'),
-('M004', 'P001', 'merchant_id',      'merchant_id',         'VARCHAR',        NULL,                                    false, true,  NULL, 4, 'FK to merchants'),
-('M005', 'P001', 'bank_code',        'bank_code',           'VARCHAR',        'LPAD(${src}, 9, ''0'')',                false, false, NULL, 5, 'NAPAS bank code (9 digits)'),
-('M006', 'P001', 'status_code',      'status_code',         'VARCHAR',        NULL,                                    false, false, NULL, 6, 'Transaction status'),
-('M007', 'P001', 'transaction_type', 'transaction_type',    'VARCHAR',        'UPPER(${src})',                         false, false, NULL, 7, 'Type: PURCHASE, TRANSFER, etc'),
-('M008', 'P001', 'created_at',       'created_at',          'TIMESTAMP',      'CAST(${src} AS TIMESTAMP)',             false, false, NULL, 8, 'Record creation time'),
-('M009', 'P001', 'updated_at',       'updated_at',          'TIMESTAMP',      'CAST(${src} AS TIMESTAMP)',             false, true,  NULL, 9, 'Last update time');
+-- Transactions column mappings (thuộc stage SILVER)
+INSERT INTO minio-datalake.metadata.column_mapping
+(mapping_id, pipeline_id, source_column, target_column, data_type, transformation,
+ is_primary_key, is_nullable, default_value, column_order, description)
+VALUES
+('M001','SLV_transactions','txn_id',           'txn_id',              'VARCHAR',        NULL,                                    true,  false, NULL, 1, 'Primary key'),
+('M002','SLV_transactions','amount',           'transaction_amount',  'DECIMAL(18,2)',  'CAST(${src} AS DECIMAL(18,2))',         false, false, NULL, 2, 'Transaction amount'),
+('M003','SLV_transactions','currency',         'currency_code',       'VARCHAR',        'UPPER(TRIM(${src}))',                   false, false, '''VND''', 3, 'ISO currency code'),
+('M004','SLV_transactions','merchant_id',      'merchant_id',         'VARCHAR',        NULL,                                    false, true,  NULL, 4, 'FK to merchants'),
+('M005','SLV_transactions','bank_code',        'bank_code',           'VARCHAR',        'LPAD(${src}, 9, ''0'')',                false, false, NULL, 5, 'NAPAS bank code (9 digits)'),
+('M006','SLV_transactions','status_code',      'status_code',         'VARCHAR',        NULL,                                    false, false, NULL, 6, 'Transaction status'),
+('M007','SLV_transactions','transaction_type', 'transaction_type',    'VARCHAR',        'UPPER(${src})',                         false, false, NULL, 7, 'Type: PURCHASE, TRANSFER, etc'),
+('M008','SLV_transactions','created_at',       'created_at',          'TIMESTAMP',      'CAST(${src} AS TIMESTAMP)',             false, false, NULL, 8, 'Record creation time'),
+('M009','SLV_transactions','updated_at',       'updated_at',          'TIMESTAMP',      'CAST(${src} AS TIMESTAMP)',             false, true,  NULL, 9, 'Last update time');
 ```
 
 ### 4.3 Transform Rules
 
+> `pipeline_id` của mỗi rule **trỏ tới stage sở hữu nó**: dedup/merge thuộc `SLV_transactions`;
+> aggregate thuộc `GLD_daily_txn` / `GLD_bank_kpis`. `depends_on` trong transform_rules là thứ tự
+> **nội bộ một stage** (vd merge sau dedup); phụ thuộc **giữa các stage** nằm ở `pipeline_config.depends_on`.
+
 ```sql
--- Silver: Dedup transactions
-INSERT INTO minio-datalake.metadata.transform_rules VALUES (
-    'T001', 'P001', 'dedup_transactions',
+-- Silver: Dedup transactions (stage SLV_transactions)
+INSERT INTO minio-datalake.metadata.transform_rules
+(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
+ sql_template, depends_on, execution_order, is_active, description)
+VALUES (
+    'T001', 'SLV_transactions', 'dedup_transactions',
     'bronze', 'silver', 'dedup',
     'CREATE TABLE minio-datalake.silver.transactions AS
      SELECT * FROM (
@@ -456,9 +454,12 @@ INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'Remove duplicate transactions, keep latest by created_at'
 );
 
--- Silver: Merge incremental
-INSERT INTO minio-datalake.metadata.transform_rules VALUES (
-    'T002', 'P001', 'merge_transactions',
+-- Silver: Merge incremental (stage SLV_transactions, chạy sau T001)
+INSERT INTO minio-datalake.metadata.transform_rules
+(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
+ sql_template, depends_on, execution_order, is_active, description)
+VALUES (
+    'T002', 'SLV_transactions', 'merge_transactions',
     'bronze', 'silver', 'merge',
     'MERGE INTO minio-datalake.silver.transactions AS target
      USING (
@@ -476,9 +477,12 @@ INSERT INTO minio-datalake.metadata.transform_rules VALUES (
     'Incremental merge new/updated transactions into silver'
 );
 
--- Gold: Daily transaction summary
-INSERT INTO minio-datalake.metadata.transform_rules VALUES (
-    'T003', 'P001', 'daily_txn_summary',
+-- Gold: Daily transaction summary (stage GLD_daily_txn)
+INSERT INTO minio-datalake.metadata.transform_rules
+(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
+ sql_template, depends_on, execution_order, is_active, description)
+VALUES (
+    'T003', 'GLD_daily_txn', 'daily_txn_summary',
     'silver', 'gold', 'aggregate',
     'CREATE OR REPLACE VIEW minio-datalake.gold.daily_transaction_summary AS
      SELECT
@@ -497,13 +501,16 @@ INSERT INTO minio-datalake.metadata.transform_rules VALUES (
        bank_code,
        transaction_type,
        status_code',
-    'T002', 3, true,
+    NULL, 1, true,
     'Daily aggregated KPIs by bank, type, status'
 );
 
--- Gold: Bank performance KPIs
-INSERT INTO minio-datalake.metadata.transform_rules VALUES (
-    'T004', 'P001', 'bank_performance_kpis',
+-- Gold: Bank performance KPIs (stage GLD_bank_kpis — fan-in 2 parent)
+INSERT INTO minio-datalake.metadata.transform_rules
+(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
+ sql_template, depends_on, execution_order, is_active, description)
+VALUES (
+    'T004', 'GLD_bank_kpis', 'bank_performance_kpis',
     'silver', 'gold', 'aggregate',
     'CREATE OR REPLACE VIEW minio-datalake.gold.bank_performance_kpis AS
      SELECT
@@ -517,52 +524,40 @@ INSERT INTO minio-datalake.metadata.transform_rules VALUES (
        AVG(transaction_amount) AS avg_transaction_value
      FROM minio-datalake.silver.transactions
      GROUP BY bank_code',
-    'T002', 4, true,
+    NULL, 1, true,
     'Bank-level performance metrics'
 );
 ```
 
 ### 4.4 Data Quality Rules
 
+> DQ rules thuộc stage chạy ra layer cần check → `pipeline_id = 'SLV_transactions'`.
+
 ```sql
--- DQ: transactions.txn_id not null
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
-    'DQ001', 'P001', 'silver', 'transactions', 'txn_id',
-    'not_null', '${column} IS NOT NULL', 'critical', 0.0, true,
-    'Transaction ID must never be null'
-);
-
--- DQ: transactions.amount positive
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
-    'DQ002', 'P001', 'silver', 'transactions', 'transaction_amount',
-    'range', '${column} >= 0', 'error', 1.0, true,
-    'Transaction amount must be non-negative (allow 1% tolerance)'
-);
-
--- DQ: transactions.bank_code format
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
-    'DQ003', 'P001', 'silver', 'transactions', 'bank_code',
-    'regex', 'LENGTH(${column}) = 9', 'warning', 5.0, true,
-    'Bank code should be 9 digits (NAPAS format)'
-);
-
--- DQ: transactions freshness
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
-    'DQ004', 'P001', 'silver', 'transactions', 'created_at',
-    'freshness',
-    'MAX(${column}) >= CURRENT_TIMESTAMP - INTERVAL ''2'' DAY',
-    'warning', 0.0, true,
-    'Data should not be more than 2 days old'
-);
-
--- DQ: transactions unique txn_id
-INSERT INTO minio-datalake.metadata.data_quality_rules VALUES (
-    'DQ005', 'P001', 'silver', 'transactions', 'txn_id',
-    'unique',
-    'COUNT(*) = COUNT(DISTINCT ${column})',
-    'error', 0.0, true,
-    'Transaction IDs must be unique in silver layer'
-);
+INSERT INTO minio-datalake.metadata.data_quality_rules
+(dq_rule_id, pipeline_id, target_layer, target_table, column_name, rule_type,
+ rule_expression, severity, threshold_pct, is_active, description)
+VALUES
+-- txn_id not null
+('DQ001','SLV_transactions','silver','transactions','txn_id',
+ 'not_null','${column} IS NOT NULL','critical',0.0,true,
+ 'Transaction ID must never be null'),
+-- amount positive (allow 1% tolerance)
+('DQ002','SLV_transactions','silver','transactions','transaction_amount',
+ 'range','${column} >= 0','error',1.0,true,
+ 'Transaction amount must be non-negative'),
+-- bank_code format (9 digits)
+('DQ003','SLV_transactions','silver','transactions','bank_code',
+ 'regex','LENGTH(${column}) = 9','warning',5.0,true,
+ 'Bank code should be 9 digits (NAPAS format)'),
+-- freshness
+('DQ004','SLV_transactions','silver','transactions','created_at',
+ 'freshness','MAX(${column}) >= CURRENT_TIMESTAMP - INTERVAL ''2'' DAY','warning',0.0,true,
+ 'Data should not be more than 2 days old'),
+-- unique txn_id
+('DQ005','SLV_transactions','silver','transactions','txn_id',
+ 'unique','COUNT(*) = COUNT(DISTINCT ${column})','error',0.0,true,
+ 'Transaction IDs must be unique in silver layer');
 ```
 
 ---
@@ -700,26 +695,27 @@ ON CONFLICT (settlement_id) DO NOTHING;
 Sau khi tạo xong, kiểm tra trong Dremio SQL Runner:
 
 ```sql
--- Kiểm tra pipeline config
-SELECT pipeline_id, pipeline_name, source_table, load_type, is_active
-FROM minio-datalake.metadata.pipeline_config;
+-- Kiểm tra pipeline config + DAG (depends_on)
+SELECT pipeline_id, dataset, source_layer, target_layer, load_type, depends_on, is_active
+FROM minio-datalake.metadata.pipeline_config
+ORDER BY dataset, target_layer;
 
--- Kiểm tra column mappings cho transactions
+-- Kiểm tra column mappings của stage silver
 SELECT source_column, target_column, data_type, transformation
 FROM minio-datalake.metadata.column_mapping
-WHERE pipeline_id = 'P001'
+WHERE pipeline_id = 'SLV_transactions'
 ORDER BY column_order;
 
--- Kiểm tra transform rules
-SELECT rule_name, source_layer, target_layer, transform_type, execution_order
+-- Kiểm tra transform rules theo stage
+SELECT pipeline_id, rule_name, source_layer, target_layer, transform_type, execution_order
 FROM minio-datalake.metadata.transform_rules
-WHERE pipeline_id = 'P001'
-ORDER BY execution_order;
+WHERE pipeline_id IN ('SLV_transactions', 'GLD_daily_txn', 'GLD_bank_kpis')
+ORDER BY pipeline_id, execution_order;
 
--- Kiểm tra DQ rules
+-- Kiểm tra DQ rules của stage silver
 SELECT column_name, rule_type, severity
 FROM minio-datalake.metadata.data_quality_rules
-WHERE pipeline_id = 'P001';
+WHERE pipeline_id = 'SLV_transactions';
 
 -- Kiểm tra source data
 -- (Chạy qua NiFi JDBC hoặc port-forward postgres)

@@ -258,3 +258,4 @@ docker   >= 25.0
 | `11-nifi-dynamic-pipeline-setup.md` | NiFi Process Group setup | Build Pipeline         |
 | `12-dynamic-sql-templates.md`    | SQL templates reference     | Bronze/Silver/Gold SQL |
 | `13-pipeline-operations-runbook.md` | Operations guide         | Day-to-day Operations  |
+| `14-pipeline-dependency-orchestration.md` | Dependency & orchestration | Event-driven bronze→silver→gold |

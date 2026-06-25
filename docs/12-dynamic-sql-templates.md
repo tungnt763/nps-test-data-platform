@@ -583,10 +583,15 @@ WHERE pipeline_id = '${pipeline_id}'
 
 ```sql
 -- Dùng bởi NiFi sau mỗi lần chạy pipeline
+-- Explicit column list (BẮT BUỘC) — không INSERT theo vị trí, tránh vỡ khi schema thêm cột
 
 INSERT INTO minio-datalake.metadata.pipeline_execution_log
+(execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
+ status, rows_processed, rows_inserted, rows_updated, rows_rejected,
+ last_watermark, error_message, execution_params, created_at)
 VALUES (
     '${pipeline_id}_${now():format("yyyyMMdd_HHmmss")}',
+    '${run_id}',
     '${pipeline_id}',
     '${pipeline_name}',
     '${layer}',

@@ -252,6 +252,10 @@ Mọi pipeline đều có thể chạy lại mà không gây duplicate:
 
 ### 4.2 Silver/Gold Transform (NiFi orchestrate → Dremio execute)
 
+> **Trigger:** Silver/gold **không** chạy theo giờ cố định mà được **đánh thức bởi sự kiện**
+> "tầng trước success" (event-driven DAG walk). Mỗi stage có `pipeline_id` + config **riêng**,
+> liên kết qua `depends_on`. Xem [14-pipeline-dependency-orchestration.md](14-pipeline-dependency-orchestration.md).
+
 ```
                     ┌──────────────────────────────────┐
                     │    metadata.transform_rules       │
@@ -359,3 +363,4 @@ Phase 4: Operations (Doc 13)
 | [11-nifi-dynamic-pipeline-setup.md](11-nifi-dynamic-pipeline-setup.md) | NiFi Process Group setup | Build pipeline |
 | [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) | SQL templates | Bronze/Silver/Gold |
 | [13-pipeline-operations-runbook.md](13-pipeline-operations-runbook.md) | Operations guide | Day-to-day ops |
+| [14-pipeline-dependency-orchestration.md](14-pipeline-dependency-orchestration.md) | Dependency & orchestration | Event-driven bronze→silver→gold |

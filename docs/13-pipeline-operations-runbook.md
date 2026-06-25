@@ -187,9 +187,14 @@ SET
     updated_at = CURRENT_TIMESTAMP
 WHERE pipeline_id = 'P002';
 
--- Seed initial watermark
-INSERT INTO minio-datalake.metadata.pipeline_execution_log VALUES (
+-- Seed initial watermark (explicit column list — không INSERT theo vị trí)
+INSERT INTO minio-datalake.metadata.pipeline_execution_log
+(execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
+ status, rows_processed, rows_inserted, rows_updated, rows_rejected,
+ last_watermark, error_message, execution_params, created_at)
+VALUES (
     'P002_SEED',
+    'SEED',
     'P002',
     'ingest_merchants',
     'bronze',
@@ -529,8 +534,10 @@ Mỗi FlowFile = 1 table config → ExecuteSQL chạy concurrent.
 # NiFi UI
 kubectl port-forward -n data-ingestion svc/nifi 8444:8443
 
-# Dremio UI
-kubectl port-forward -n data-processing svc/dremio-service 9047:9047
+# Dremio UI  (service tên là `dremio`, KHÔNG phải `dremio-service`)
+kubectl port-forward -n data-processing svc/dremio 9047:9047
+# Lưu ý: port-forward KHÔNG tự reconnect khi pod restart. Nếu UI timeout mà
+# `kubectl get pods -n data-processing` thấy RESTARTS tăng → kill và chạy lại lệnh này.
 
 # MinIO Console
 kubectl port-forward -n data-storage svc/minio-console 9002:9001

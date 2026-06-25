@@ -1,108 +1,132 @@
 # NiFi Dynamic Pipeline Setup
 
-> **Phiên bản:** 1.0 | **Ngày:** 2026-06-24
+> **Phiên bản:** 2.0 | **Ngày:** 2026-06-25
 > **Yêu cầu:** Dremio JDBC driver trong NiFi, metadata tables đã tạo (Doc 10)
-> **Tham chiếu:** [09-metadata-driven-strategy.md](09-metadata-driven-strategy.md) | [10-metadata-tables-design.md](10-metadata-tables-design.md)
+> **Tham chiếu:** [09-metadata-driven-strategy.md](09-metadata-driven-strategy.md) | [10-metadata-tables-design.md](10-metadata-tables-design.md) | [14-pipeline-dependency-orchestration.md](14-pipeline-dependency-orchestration.md)
+>
+> **⚠️ v2.0 thay đổi lớn so với v1.0:** Bỏ hoàn toàn cơ chế **time-based trigger** (silver chạy
+> theo CRON lệch giờ) và mô hình **config 1-dòng/bảng**. Thay bằng **event-driven orchestration**:
+> mỗi layer-transition là 1 stage độc lập, stage trước xong sẽ tự đánh thức stage sau qua
+> `depends_on`. Xem lý do ở [Doc 14](14-pipeline-dependency-orchestration.md).
+> Nếu bạn đã build theo v1.0, xem **§12 Migration** ở cuối.
 
 ---
 
-## 1. Tổng Quan NiFi Flow
+## 1. Tổng Quan NiFi Flow (v2.0)
 
-### 1.1 Process Group Hierarchy
+### 1.1 Nguyên tắc
+
+```
+1 stage = 1 dòng pipeline_config (có pipeline_id riêng + depends_on)
+NiFi đọc DAG từ metadata lúc runtime → đi hết các stage theo cạnh depends_on
+Connection "success" của NiFi CHÍNH LÀ dependency — không dùng đồng hồ
+FlowFile giữa các stage chỉ mang correlation key (run_id, next_pipeline_id)
+Mỗi executor TỰ nạp config của chính nó (Load Own Config) — không kế thừa tầng trước
+```
+
+### 1.2 Process Group Hierarchy
 
 ```
 Root Process Group
 │
 ├── PG: [1] Metadata Controller
-│   ├── Read pipeline_config from Dremio
-│   ├── Split per table config
-│   ├── Route by target_layer
+│   ├── Trigger (CRON, 1 lần/ngày)
+│   ├── Sinh run_id
+│   ├── Đọc ROOT stages (depends_on IS NULL) từ pipeline_config
+│   ├── Split per root → set next_pipeline_id, target_layer, run_id
+│   └── Output Port: to-router
+│
+├── PG: [2] Stage Router
+│   ├── Input Port: from-upstream  (nhận từ Controller VÀ từ Resolve Next)
+│   ├── RouteOnAttribute theo target_layer
 │   └── Output Ports: to-bronze, to-silver, to-gold
 │
-├── PG: [2] Bronze Ingestion
-│   ├── Input Port: from-metadata
+├── PG: [3] Bronze Ingestion
+│   ├── Input Port: from-router
+│   ├── Load Own Config (theo next_pipeline_id)
 │   ├── Route by load_type (full/incremental)
-│   ├── Get last watermark (incremental only)
-│   ├── Execute dynamic SQL on source DB
-│   ├── Write Parquet to MinIO
-│   └── Log execution
+│   ├── Get last watermark (incremental) — keyed theo pipeline_id bronze
+│   ├── Execute dynamic SQL on source DB → Parquet → MinIO
+│   ├── Log execution (kèm run_id)
+│   └── Output Port: to-resolver
 │
-├── PG: [3] Silver Transform Orchestrator
-│   ├── Input Port: from-metadata
-│   ├── Read transform_rules from Dremio
-│   ├── Execute transforms on Dremio
-│   ├── Run DQ checks
-│   └── Log execution
+├── PG: [4] Silver Transform Orchestrator
+│   ├── Input Port: from-router
+│   ├── (Wait barrier — chỉ khi multi-parent, xem §10)
+│   ├── Load Own Config (theo next_pipeline_id = SLV_*)
+│   ├── Read transform_rules WHERE pipeline_id = SLV_* ORDER BY execution_order
+│   ├── Render + Execute SQL trên Dremio
+│   ├── DQ checks (tùy chọn)
+│   ├── Log execution (kèm run_id, layer='silver')
+│   └── Output Port: to-resolver
 │
-├── PG: [4] Gold Transform Orchestrator
-│   ├── Input Port: from-metadata
-│   ├── Read transform_rules from Dremio
-│   ├── Execute aggregations on Dremio
-│   └── Log execution
+├── PG: [5] Gold Transform Orchestrator
+│   └── (giống Silver, layer='gold'; multi-parent dùng Wait/Notify — §10)
 │
-└── PG: [5] Pipeline Monitor
-    ├── Query execution_log
-    ├── Check failures
-    └── Alert on errors
+├── PG: [6] Resolve Next Stages
+│   ├── Input Port: from-executor  (nhận từ Bronze/Silver/Gold)
+│   ├── Query downstream: WHERE depends_on chứa ${pipeline_id}
+│   ├── Split → set next_pipeline_id, target_layer, giữ run_id
+│   ├── (Notify — chỉ khi dùng barrier, §10)
+│   └── Output Port: to-router   ──► LOOP về [2] Stage Router
+│
+└── PG: [7] Pipeline Monitor (tùy chọn)
+    └── Query execution_log, alert on failures (Doc 13)
 ```
 
-### 1.2 Controller Services cần tạo
+**Vòng lặp DAG:** `Controller → Router → Executor → Resolve Next → Router → ...` cho tới khi
+Resolve Next không tìm thấy downstream (stage lá) thì luồng kết thúc tự nhiên.
 
-| Controller Service          | Type                    | Mục đích                    |
-|-----------------------------|-------------------------|-----------------------------|
-| `dremio-jdbc-pool`          | DBCPConnectionPool      | Connect NiFi → Dremio       |
-| `source-postgres-pool`      | DBCPConnectionPool      | Connect NiFi → Source DB    |
-| `avro-reader`               | AvroReader              | Đọc output ExecuteSQL       |
-| `json-reader`               | JsonTreeReader          | Đọc metadata JSON           |
-| `json-record-set-writer`    | JsonRecordSetWriter     | Ghi output dạng JSON        |
-| `parquet-writer`            | ParquetRecordSetWriter  | Ghi Parquet cho bronze      |
-| `s3-credentials`            | AWSCredentialsProvider  | MinIO S3 credentials        |
+### 1.3 Controller Services cần tạo
+
+| Controller Service          | Type                              | Mục đích                          |
+|-----------------------------|----------------------------------|-----------------------------------|
+| `dremio-jdbc-pool`          | DBCPConnectionPool               | Connect NiFi → Dremio             |
+| `source-postgres-pool`      | DBCPConnectionPool               | Connect NiFi → Source DB          |
+| `avro-reader`               | AvroReader                       | Đọc output ExecuteSQL             |
+| `json-reader`               | JsonTreeReader                   | Đọc metadata JSON                 |
+| `json-record-set-writer`    | JsonRecordSetWriter              | Ghi output dạng JSON              |
+| `parquet-writer`            | ParquetRecordSetWriter           | Ghi Parquet cho bronze            |
+| `s3-credentials`            | AWSCredentialsProvider           | MinIO S3 credentials              |
+| `dmc-server` *(§10)*        | DistributedMapCacheServer        | Backend Wait/Notify + dedup       |
+| `dmc-client` *(§10)*        | DistributedMapCacheClientService | Client cho Wait/Notify + dedup    |
+
+> `dmc-server`/`dmc-client` chỉ bắt buộc nếu DAG của bạn có stage **nhiều parent** (fan-in).
+> DAG dạng cây/tuyến tính (mỗi stage 1 parent) không cần — bỏ qua §10.
 
 ---
 
 ## 2. Prerequisites — Cài Đặt JDBC Drivers
 
-### 2.1 Dremio JDBC Driver
-
-NiFi cần Dremio JDBC driver để kết nối Dremio qua JDBC (port 31010).
+### 2.1 Dremio + PostgreSQL JDBC Driver
 
 ```bash
-# Download Dremio JDBC driver vào NiFi pod
+# Dremio JDBC driver
 kubectl exec -n data-ingestion nifi-0 -- curl -L -o /opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar "https://download.dremio.com/jdbc-driver/24.3.2-202401241821100032-d2d8a497/dremio-jdbc-driver-24.3.2-202401241821100032-d2d8a497.jar"
 
-# Verify
-kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar
-```
-
-> **Lưu ý:** Driver mất khi pod restart. Xem phần 8 để setup initContainer cho permanent fix.
-
-### 2.2 PostgreSQL JDBC Driver
-
-```bash
-# Download PostgreSQL JDBC driver (nếu chưa có)
+# PostgreSQL JDBC driver
 kubectl exec -n data-ingestion nifi-0 -- curl -L -o /opt/nifi/nifi-current/lib/postgresql-42.7.2.jar "https://jdbc.postgresql.org/download/postgresql-42.7.2.jar"
 
-kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/postgresql-42.7.2.jar
+# Verify
+kubectl exec -n data-ingestion nifi-0 -- ls -la /opt/nifi/nifi-current/lib/ | grep -E "dremio|postgresql"
 ```
 
-### 2.3 Restart NiFi để load drivers
+### 2.2 Restart NiFi để load drivers
 
 ```bash
-# Restart NiFi pod để load new JARs
 kubectl delete pod -n data-ingestion nifi-0
-# Chờ pod khởi động lại (~2-3 phút)
 kubectl wait --for=condition=ready pod/nifi-0 -n data-ingestion --timeout=300s
 ```
+
+> **Lưu ý:** Driver mất khi pod restart. Xem §11 để setup initContainer cho permanent fix.
 
 ---
 
 ## 3. Controller Services Setup
 
-Truy cập NiFi UI: `https://localhost:8444/nifi`
+Truy cập NiFi UI: `https://localhost:8444/nifi` → Controller Settings (gear) → Management Controller Services.
 
-### 3.1 Tạo Dremio JDBC Connection Pool
-
-**NiFi UI → Controller Settings (gear icon) → Management Controller Services → + icon**
+### 3.1 Dremio JDBC Connection Pool
 
 | Property                    | Value                                                           |
 |-----------------------------|-----------------------------------------------------------------|
@@ -113,12 +137,11 @@ Truy cập NiFi UI: `https://localhost:8444/nifi`
 | **Database Driver Location(s)** | `/opt/nifi/nifi-current/lib/dremio-jdbc-driver-24.3.2.jar` |
 | **Database User**           | `admin`                                                         |
 | **Password**                | (Dremio admin password)                                         |
-| **Max Wait Time**           | `10 secs`                                                       |
 | **Max Total Connections**   | `5`                                                             |
 
-→ Click **Enable** (lightning icon)
+→ **Enable**
 
-### 3.2 Tạo Source PostgreSQL Connection Pool
+### 3.2 Source PostgreSQL Connection Pool
 
 | Property                    | Value                                                           |
 |-----------------------------|-----------------------------------------------------------------|
@@ -129,55 +152,30 @@ Truy cập NiFi UI: `https://localhost:8444/nifi`
 | **Database Driver Location(s)** | `/opt/nifi/nifi-current/lib/postgresql-42.7.2.jar`          |
 | **Database User**           | `superset`                                                      |
 | **Password**                | `SupersetPostgres2024`                                          |
-| **Max Wait Time**           | `10 secs`                                                       |
 | **Max Total Connections**   | `5`                                                             |
 
-→ Click **Enable**
+→ **Enable**
 
-### 3.3 Tạo Record Services
+### 3.3 Record Services
 
-**AvroReader:**
+| Name | Type | Cấu hình quan trọng |
+|------|------|---------------------|
+| `avro-reader` | `AvroReader` | (default) |
+| `json-reader` | `JsonTreeReader` | Schema Access Strategy = `Infer Schema` |
+| `json-record-set-writer` | `JsonRecordSetWriter` | Schema Access Strategy = `Inherit Record Schema` |
 
-| Property | Value |
-|----------|-------|
-| **Name** | `avro-reader` |
-| **Type** | `AvroReader` |
-
-→ Enable
-
-**JsonTreeReader:**
-
-| Property | Value |
-|----------|-------|
-| **Name** | `json-reader` |
-| **Type** | `JsonTreeReader` |
-| **Schema Access Strategy** | `Infer Schema` |
-
-→ Enable
-
-**JsonRecordSetWriter:**
-
-| Property | Value |
-|----------|-------|
-| **Name** | `json-record-set-writer` |
-| **Type** | `JsonRecordSetWriter` |
-| **Schema Access Strategy** | `Inherit Record Schema` |
-
-→ Enable
+→ Enable cả 3.
 
 ---
 
-## 4. Process Group 1: Metadata Controller
+## 4. Process Group [1]: Metadata Controller
 
-### 4.1 Tạo Process Group
+Đây là điểm khởi động duy nhất của toàn bộ DAG: sinh `run_id`, đọc các **root stage**
+(ingestion), và đẩy chúng vào Stage Router.
 
-Right-click canvas → **Add Process Group** → Name: `[1] Metadata Controller`
+Right-click canvas → **Add Process Group** → `[1] Metadata Controller`. Double-click để mở.
 
-Double-click để mở PG.
-
-### 4.2 Processor: GenerateFlowFile (Trigger)
-
-Processor này trigger pipeline theo schedule.
+### 4.1 Processor: GenerateFlowFile (Trigger)
 
 | Property               | Value                                     |
 |------------------------|-------------------------------------------|
@@ -185,234 +183,173 @@ Processor này trigger pipeline theo schedule.
 | **Scheduling Strategy**| `CRON_DRIVEN`                             |
 | **Schedule**           | `0 0 2 * * ?` (2h sáng mỗi ngày)         |
 | **Custom Text**        | `trigger`                                 |
-| **Run Schedule**       | `0 sec` (mặc định)                        |
 
-> **Tip:** Để test, tạm dùng `Timer Driven` với schedule `60 sec` hoặc trigger manual (Right-click → Run Once)
+> **Test:** tạm dùng `Timer Driven` `60 sec`, hoặc Right-click → **Run Once**.
 
-### 4.3 Processor: ExecuteSQL (Read Active Pipelines)
+### 4.2 Processor: UpdateAttribute (Generate Run ID) — MỚI
 
-| Property                       | Value                                                                |
-|--------------------------------|----------------------------------------------------------------------|
-| **Name**                       | `Read Active Pipeline Configs`                                       |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool`                                            |
-| **SQL select query**           | (xem bên dưới)                                                       |
-| **Max Rows Per Flow File**     | `0` (unlimited)                                                      |
+Sinh **một** `run_id` cho cả lần chạy; nó sẽ propagate xuống mọi stage để tương quan/lineage.
 
-**SQL Query:**
+| Property  | Value                                                              |
+|-----------|-------------------------------------------------------------------|
+| **Name**  | `Generate Run ID`                                                 |
+| `run_id`  | `RUN_${now():format('yyyyMMddHHmmss')}_${UUID():substring(0,8)}`  |
+
+**Connection:** `Trigger Pipeline Run` → success → `Generate Run ID`
+
+### 4.3 Processor: ExecuteSQL (Read Root Pipelines)
+
+Chỉ đọc **root** (`depends_on IS NULL`) — tức các bronze ingestion. Silver/gold KHÔNG đọc ở đây;
+chúng được Resolve Next đánh thức.
+
+| Property                       | Value                  |
+|--------------------------------|------------------------|
+| **Name**                       | `Read Root Pipelines`  |
+| **Database Connection Pooling Service** | `dremio-jdbc-pool` |
+| **SQL select query**           | (xem dưới)             |
+
 ```sql
-SELECT
-    pipeline_id,
-    pipeline_name,
-    source_type,
-    source_connection,
-    source_schema,
-    source_table,
-    target_layer,
-    target_path,
-    target_table,
-    load_type,
-    primary_keys,
-    watermark_column,
-    partition_columns,
-    batch_size,
-    schedule_cron,
-    is_active,
-    description
+SELECT pipeline_id, target_layer
 FROM minio-datalake.metadata.pipeline_config
 WHERE is_active = true
+  AND depends_on IS NULL
 ORDER BY pipeline_id
 ```
 
-**Connection:** `Trigger Pipeline Run` → success → `Read Active Pipeline Configs`
+> Chỉ cần `pipeline_id` + `target_layer` cho việc routing — config đầy đủ sẽ được
+> executor tự nạp ở bước "Load Own Config".
 
-### 4.4 Processor: ConvertAvroToJSON
+**Connection:** `Generate Run ID` → success → `Read Root Pipelines`
 
-| Property       | Value            |
-|----------------|------------------|
-| **Name**       | `Config to JSON` |
-| **JSON Format**| `One line per Avro record` |
+### 4.4 ConvertAvroToJSON → SplitJson → EvaluateJsonPath
 
-**Connection:** `Read Active Pipeline Configs` → success → `Config to JSON`
+| Processor | Cấu hình |
+|-----------|----------|
+| `ConvertAvroToJSON` (`Config to JSON`) | JSON Format = `One line per Avro record` |
+| `SplitJson` (`Split Per Root`) | JsonPath Expression = `$[*]` |
+| `EvaluateJsonPath` (`Set Correlation Attrs`) | Destination = `flowfile-attribute`; `next_pipeline_id` = `$.pipeline_id`, `target_layer` = `$.target_layer` |
 
-### 4.5 Processor: SplitJson
+> `run_id` đã là attribute (set ở §4.2) nên tự đi theo qua Split. Sau bước này mỗi FlowFile mang:
+> `run_id`, `next_pipeline_id`, `target_layer`.
 
-| Property              | Value   |
-|-----------------------|---------|
-| **Name**              | `Split Per Table Config` |
-| **JsonPath Expression** | `$[*]` |
+**Connections:** `Read Root Pipelines` → `Config to JSON` → `Split Per Root` (split) → `Set Correlation Attrs`
 
-**Connection:** `Config to JSON` → success → `Split Per Table Config`
+### 4.5 Output Port
 
-### 4.6 Processor: EvaluateJsonPath
-
-Trích xuất tất cả config fields thành FlowFile attributes.
-
-| Property               | Value                           |
-|------------------------|----------------------------------|
-| **Name**               | `Extract Config Attributes`     |
-| **Destination**        | `flowfile-attribute`            |
-| **Return Type**        | `auto-detect`                   |
-
-**Dynamic Properties (thêm bằng + icon):**
-
-| Property Name       | JsonPath Value            |
-|---------------------|--------------------------|
-| `pipeline_id`       | `$.pipeline_id`          |
-| `pipeline_name`     | `$.pipeline_name`        |
-| `source_type`       | `$.source_type`          |
-| `source_connection` | `$.source_connection`    |
-| `source_schema`     | `$.source_schema`        |
-| `source_table`      | `$.source_table`         |
-| `target_layer`      | `$.target_layer`         |
-| `target_path`       | `$.target_path`          |
-| `target_table`      | `$.target_table`         |
-| `load_type`         | `$.load_type`            |
-| `primary_keys`      | `$.primary_keys`         |
-| `watermark_column`  | `$.watermark_column`     |
-| `partition_columns` | `$.partition_columns`    |
-| `batch_size`        | `$.batch_size`           |
-
-**Connection:** `Split Per Table Config` → split → `Extract Config Attributes`
-
-### 4.7 Processor: RouteOnAttribute (Route by Layer)
-
-| Property        | Value                                |
-|-----------------|--------------------------------------|
-| **Name**        | `Route by Target Layer`             |
-| **Routing Strategy** | `Route to Property name`       |
-
-**Dynamic Properties:**
-
-| Property Name | Value (NiFi Expression Language)    |
-|---------------|-------------------------------------|
-| `bronze`      | `${target_layer:equals('bronze')}`  |
-| `silver`      | `${target_layer:equals('silver')}`  |
-| `gold`        | `${target_layer:equals('gold')}`    |
-
-**Connection:** `Extract Config Attributes` → matched → `Route by Target Layer`
-
-### 4.8 Output Ports
-
-Tạo 3 Output Ports trong Process Group:
-- `to-bronze` ← Connection từ RouteOnAttribute → `bronze`
-- `to-silver` ← Connection từ RouteOnAttribute → `silver`
-- `to-gold` ← Connection từ RouteOnAttribute → `gold`
-
-### 4.9 Flow Diagram
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  PG: [1] Metadata Controller                                 │
-│                                                              │
-│  ┌─────────────────────┐                                    │
-│  │ Trigger Pipeline    │ (CRON: 0 0 2 * * ?)                │
-│  │ Run                 │                                    │
-│  └─────────┬───────────┘                                    │
-│            │ success                                        │
-│  ┌─────────▼───────────┐                                    │
-│  │ Read Active         │ (ExecuteSQL → Dremio)              │
-│  │ Pipeline Configs    │                                    │
-│  └─────────┬───────────┘                                    │
-│            │ success                                        │
-│  ┌─────────▼───────────┐                                    │
-│  │ Config to JSON      │ (ConvertAvroToJSON)                │
-│  └─────────┬───────────┘                                    │
-│            │ success                                        │
-│  ┌─────────▼───────────┐                                    │
-│  │ Split Per Table     │ (SplitJson $[*])                   │
-│  │ Config              │                                    │
-│  └─────────┬───────────┘                                    │
-│            │ split                                          │
-│  ┌─────────▼───────────┐                                    │
-│  │ Extract Config      │ (EvaluateJsonPath)                 │
-│  │ Attributes          │                                    │
-│  └─────────┬───────────┘                                    │
-│            │ matched                                        │
-│  ┌─────────▼───────────┐                                    │
-│  │ Route by Target     │ (RouteOnAttribute)                 │
-│  │ Layer               │                                    │
-│  └──┬──────┬──────┬────┘                                    │
-│     │      │      │                                         │
-│  ┌──▼──┐┌──▼──┐┌──▼──┐                                     │
-│  │OUT: ││OUT: ││OUT: │                                     │
-│  │to-  ││to-  ││to-  │                                     │
-│  │bronz││silv ││gold │                                     │
-│  └─────┘└─────┘└─────┘                                     │
-└──────────────────────────────────────────────────────────────┘
-```
+Tạo Output Port `to-router`. **Connection:** `Set Correlation Attrs` → matched → `to-router`.
 
 ---
 
-## 5. Process Group 2: Bronze Ingestion
+## 5. Process Group [2]: Stage Router
 
-### 5.1 Tạo Process Group
+Điểm hội tụ: nhận FlowFile từ **Controller** (root) và từ **Resolve Next** (downstream), rồi
+route theo `target_layer` tới đúng executor. Đây là trục của vòng lặp DAG.
 
-Trở lại Root canvas → Add Process Group → Name: `[2] Bronze Ingestion`
+Root canvas → Add PG → `[2] Stage Router`. Kéo connection `[1] Metadata Controller`
+(`to-router`) → `[2] Stage Router`. Mở PG.
 
-### 5.2 Connect từ Metadata Controller
+### 5.1 Input Port
 
-Kéo connection từ `[1] Metadata Controller` (output port `to-bronze`) → `[2] Bronze Ingestion`
+Tạo Input Port: `from-upstream`.
 
-Double-click PG để mở.
+### 5.2 Processor: RouteOnAttribute (Route by Target Layer)
 
-### 5.3 Input Port
-
-Tạo **Input Port**: `from-metadata`
-
-### 5.4 Processor: RouteOnAttribute (Route by Load Type)
-
-| Property        | Value                                    |
-|-----------------|------------------------------------------|
-| **Name**        | `Route by Load Type`                     |
-| **Routing Strategy** | `Route to Property name`            |
+| Property | Value |
+|----------|-------|
+| **Name** | `Route by Target Layer` |
+| **Routing Strategy** | `Route to Property name` |
 
 **Dynamic Properties:**
 
-| Property Name  | Value                                     |
-|----------------|-------------------------------------------|
-| `full`         | `${load_type:equals('full')}`             |
-| `incremental`  | `${load_type:equals('incremental')}`      |
+| Property Name | Value |
+|---------------|-------|
+| `bronze` | `${target_layer:equals('bronze')}` |
+| `silver` | `${target_layer:equals('silver')}` |
+| `gold`   | `${target_layer:equals('gold')}` |
 
-**Connection:** `from-metadata` → `Route by Load Type`
+**Connection:** `from-upstream` → `Route by Target Layer`
 
-### 5.5 Full Load Path
+### 5.3 Output Ports
 
-#### Processor: GenerateFlowFile (Build Full Load SQL)
+Tạo 3 Output Ports, nối từ RouteOnAttribute:
+- `to-bronze` ← relationship `bronze`
+- `to-silver` ← relationship `silver`
+- `to-gold` ← relationship `gold`
 
-| Property         | Value                                                             |
-|------------------|-------------------------------------------------------------------|
-| **Name**         | `Build Full Load SQL`                                             |
-| **Custom Text**  | `SELECT * FROM ${source_schema}.${source_table}`                  |
-| **Run Schedule** | `0 sec`                                                           |
+---
 
-> **Quan trọng:** Custom Text hỗ trợ Expression Language.
-> `${source_schema}` và `${source_table}` sẽ được resolve từ FlowFile attributes.
+## 6. Process Group [3]: Bronze Ingestion
 
-**Thực ra**, GenerateFlowFile không nhận FlowFile đầu vào (nó tạo mới). Ta cần approach khác:
+Root canvas → Add PG → `[3] Bronze Ingestion`. Kéo connection `[2] Stage Router` (`to-bronze`)
+→ `[3] Bronze Ingestion`. Mở PG. Tạo Input Port `from-router`.
 
-#### Processor: ReplaceText (Build Full Load SQL) — ĐÚNG CÁCH
+### 6.1 Processor: ExecuteSQL (Load Own Config) — đầu mỗi stage
 
-| Property                 | Value                                                       |
-|--------------------------|-------------------------------------------------------------|
-| **Name**                 | `Build Full Load SQL`                                       |
-| **Search Value**         | `(?s)(^.*$)`                                                |
-| **Replacement Value**    | `SELECT * FROM ${source_schema}.${source_table}`            |
-| **Replacement Strategy** | `Regex Replace`                                             |
-| **Evaluation Mode**      | `Entire text`                                               |
+Mỗi stage TỰ nạp config của chính nó từ `next_pipeline_id` (không kế thừa attribute tầng trước).
+
+| Property | Value |
+|----------|-------|
+| **Name** | `Load Own Config` |
+| **Database Connection Pooling Service** | `dremio-jdbc-pool` |
+| **SQL select query** | (xem dưới) |
+
+```sql
+SELECT pipeline_id, pipeline_name, source_connection, source_schema, source_table,
+       load_type, primary_keys, watermark_column, partition_columns,
+       target_layer, target_path, target_table, batch_size
+FROM minio-datalake.metadata.pipeline_config
+WHERE pipeline_id = '${next_pipeline_id}'
+  AND is_active = true
+```
+
+→ `ConvertAvroToJSON` (`Config to JSON`) → `EvaluateJsonPath` (`Extract Config Attributes`,
+Destination = `flowfile-attribute`) với các property:
+
+| Property | JsonPath |
+|----------|----------|
+| `pipeline_id` | `$.pipeline_id` |
+| `pipeline_name` | `$.pipeline_name` |
+| `source_schema` | `$.source_schema` |
+| `source_table` | `$.source_table` |
+| `load_type` | `$.load_type` |
+| `primary_keys` | `$.primary_keys` |
+| `watermark_column` | `$.watermark_column` |
+| `partition_columns` | `$.partition_columns` |
+| `target_table` | `$.target_table` |
+| `batch_size` | `$.batch_size` |
+
+**Connections:** `from-router` → `Load Own Config` → `Config to JSON` → `Extract Config Attributes`
+
+### 6.2 Processor: RouteOnAttribute (Route by Load Type)
+
+| Property | Value |
+|----------|-------|
+| **Name** | `Route by Load Type` |
+| **Routing Strategy** | `Route to Property name` |
+
+| Property Name | Value |
+|---------------|-------|
+| `full` | `${load_type:equals('full')}` |
+| `incremental` | `${load_type:equals('incremental')}` |
+
+**Connection:** `Extract Config Attributes` → matched → `Route by Load Type`
+
+### 6.3 Full Load Path — ReplaceText (Build Full Load SQL)
+
+| Property | Value |
+|----------|-------|
+| **Name** | `Build Full Load SQL` |
+| **Search Value** | `(?s)(^.*$)` |
+| **Replacement Value** | `SELECT * FROM ${source_schema}.${source_table}` |
+| **Replacement Strategy** | `Regex Replace` |
+| **Evaluation Mode** | `Entire text` |
 
 **Connection:** `Route by Load Type` → `full` → `Build Full Load SQL`
 
-### 5.6 Incremental Load Path
+### 6.4 Incremental Load Path
 
-#### Processor: ExecuteSQL (Get Last Watermark)
+**ExecuteSQL (`Get Last Watermark`)** trên `dremio-jdbc-pool` — keyed theo **pipeline_id bronze**:
 
-| Property                              | Value                                                                 |
-|---------------------------------------|-----------------------------------------------------------------------|
-| **Name**                              | `Get Last Watermark`                                                  |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool`                                                  |
-| **SQL select query**                  | (xem bên dưới)                                                        |
-
-**SQL Query:**
 ```sql
 SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
 FROM minio-datalake.metadata.pipeline_execution_log
@@ -421,390 +358,296 @@ WHERE pipeline_id = '${pipeline_id}'
   AND status = 'success'
 ```
 
-**Connection:** `Route by Load Type` → `incremental` → `Get Last Watermark`
-
-#### Processor: ConvertAvroToJSON → EvaluateJsonPath
-
-Trích xuất `last_watermark` thành attribute:
-
-**ConvertAvroToJSON:**
+→ `ConvertAvroToJSON` (`Watermark to JSON`) → `EvaluateJsonPath` (`Extract Watermark`:
+`last_watermark` = `$.last_watermark`) → `ReplaceText` (`Build Incremental SQL`):
 
 | Property | Value |
 |----------|-------|
-| **Name** | `Watermark to JSON` |
+| **Search Value** | `(?s)(^.*$)` |
+| **Replacement Value** | `SELECT * FROM ${source_schema}.${source_table} WHERE ${watermark_column} > '${last_watermark}'` |
+| **Replacement Strategy** | `Regex Replace` |
+| **Evaluation Mode** | `Entire text` |
 
-**EvaluateJsonPath:**
+**Connections:** `Route by Load Type` → `incremental` → `Get Last Watermark` → `Watermark to JSON` → `Extract Watermark` → `Build Incremental SQL`
 
-| Property          | Value                    |
-|-------------------|--------------------------|
-| **Name**          | `Extract Watermark`      |
-| **Destination**   | `flowfile-attribute`     |
-| `last_watermark`  | `$.last_watermark`       |
+### 6.5 Execute Source Query
 
-**Connection:** `Get Last Watermark` → success → `Watermark to JSON` → success → `Extract Watermark`
+**ExecuteSQL (`Execute Source Query`)** trên `source-postgres-pool`, **SQL select query để trống**
+(đọc SQL từ FlowFile content).
 
-#### Processor: ReplaceText (Build Incremental SQL)
+**Connections:** `Build Full Load SQL` → `Execute Source Query`; `Build Incremental SQL` → `Execute Source Query`.
 
-| Property                 | Value                                                                                             |
-|--------------------------|---------------------------------------------------------------------------------------------------|
-| **Name**                 | `Build Incremental SQL`                                                                           |
-| **Search Value**         | `(?s)(^.*$)`                                                                                      |
-| **Replacement Value**    | `SELECT * FROM ${source_schema}.${source_table} WHERE ${watermark_column} > '${last_watermark}'`  |
-| **Replacement Strategy** | `Regex Replace`                                                                                   |
-| **Evaluation Mode**      | `Entire text`                                                                                     |
+### 6.6 Write to MinIO
 
-**Connection:** `Extract Watermark` → matched → `Build Incremental SQL`
+**UpdateAttribute (`Set S3 Output Path`):**
 
-### 5.7 Merge Paths → Execute SQL on Source
+| Property | Value |
+|----------|-------|
+| `filename` | `${source_table}_${now():format('yyyyMMdd_HHmmss')}.avro` |
+| `s3.key` | `bronze/${source_table}/dt=${now():format('yyyy-MM-dd')}/${filename}` |
 
-Cả 2 đường (full + incremental) đều tạo FlowFile chứa SQL query. Giờ cần execute.
+**PutS3Object (`Write to MinIO Bronze`):**
 
-#### Processor: ExecuteSQL (Run Source Query)
+| Property | Value |
+|----------|-------|
+| **Object Key** | `${s3.key}` |
+| **Bucket** | `napas-datalake` |
+| **Access Key ID** | `napas-admin` |
+| **Secret Access Key** | `napas-minio-s3cr3t-2024` |
+| **Endpoint Override URL** | `http://minio.data-storage.svc.cluster.local:9000` |
+| **Signer Override** | `AWSS3V4SignerType` |
+| **Region** | `us-east-1` |
+| **Use Path Style Access** | `true` |
 
-| Property                              | Value                                                       |
-|---------------------------------------|-------------------------------------------------------------|
-| **Name**                              | `Execute Source Query`                                      |
-| **Database Connection Pooling Service** | `source-postgres-pool`                                    |
-| **SQL select query**                  | (để trống — lấy SQL từ FlowFile content)                    |
+**Connections:** `Execute Source Query` → `Set S3 Output Path` → `Write to MinIO Bronze`
 
-> **Cách hoạt động:** Khi "SQL select query" để trống, ExecuteSQL đọc SQL từ nội dung FlowFile.
-> FlowFile content lúc này chứa dynamic SQL đã render (từ ReplaceText).
+### 6.7 Log Execution (kèm run_id)
 
-**Connection:**
-- `Build Full Load SQL` → success → `Execute Source Query`
-- `Build Incremental SQL` → success → `Execute Source Query`
+**ReplaceText (`Build Execution Log SQL`):** Search `(?s)(^.*$)`, Strategy `Regex Replace`, Entire text. Replacement Value:
 
-### 5.8 Convert & Write to MinIO
-
-#### Processor: UpdateAttribute (Set S3 Key)
-
-| Property   | Value                                                                         |
-|------------|-------------------------------------------------------------------------------|
-| **Name**   | `Set S3 Output Path`                                                          |
-| `filename` | `${source_table}_${now():format('yyyyMMdd_HHmmss')}.avro`                    |
-| `s3.key`   | `bronze/${source_table}/dt=${now():format('yyyy-MM-dd')}/${filename}`         |
-
-**Connection:** `Execute Source Query` → success → `Set S3 Output Path`
-
-#### Processor: PutS3Object (Write to MinIO)
-
-| Property                     | Value                                                        |
-|------------------------------|--------------------------------------------------------------|
-| **Name**                     | `Write to MinIO Bronze`                                      |
-| **Object Key**               | `${s3.key}`                                                  |
-| **Bucket**                   | `napas-datalake`                                             |
-| **Access Key ID**            | `napas-admin`                                                |
-| **Secret Access Key**        | `napas-minio-s3cr3t-2024`                                    |
-| **Endpoint Override URL**    | `http://minio.data-storage.svc.cluster.local:9000`           |
-| **Signer Override**          | `AWSS3V4SignerType`                                          |
-| **Region**                   | `us-east-1`                                                  |
-| **Use Path Style Access**    | `true`                                                       |
-
-> **Lưu ý:** NiFi 1.x dùng `PutS3Object`, NiFi 2.x dùng `PutS3Object` hoặc `PutObject` (AWS SDK v2).
-> Verify processor name trong NiFi version bạn đang dùng.
-
-**Connection:** `Set S3 Output Path` → success → `Write to MinIO Bronze`
-
-### 5.9 Log Execution
-
-#### Processor: ReplaceText (Build Log SQL)
-
-| Property                 | Value                                                                                 |
-|--------------------------|---------------------------------------------------------------------------------------|
-| **Name**                 | `Build Execution Log SQL`                                                              |
-| **Search Value**         | `(?s)(^.*$)`                                                                           |
-| **Replacement Value**    | (xem bên dưới)                                                                         |
-| **Replacement Strategy** | `Regex Replace`                                                                        |
-| **Evaluation Mode**      | `Entire text`                                                                          |
-
-**Replacement Value:**
 ```
-INSERT INTO minio-datalake.metadata.pipeline_execution_log VALUES (
+INSERT INTO minio-datalake.metadata.pipeline_execution_log
+(execution_id, run_id, pipeline_id, pipeline_name, layer, start_time, end_time,
+ status, rows_processed, rows_inserted, rows_updated, rows_rejected,
+ last_watermark, error_message, execution_params, created_at)
+VALUES (
     '${pipeline_id}_${now():format('yyyyMMdd_HHmmss')}',
-    '${pipeline_id}',
-    '${pipeline_name}',
-    'bronze',
+    '${run_id}', '${pipeline_id}', '${pipeline_name}', 'bronze',
     CAST('${now():format('yyyy-MM-dd HH:mm:ss')}' AS TIMESTAMP),
     CAST('${now():format('yyyy-MM-dd HH:mm:ss')}' AS TIMESTAMP),
-    'success',
-    ${executesql.row.count},
-    ${executesql.row.count},
-    0,
-    0,
-    '${now():format('yyyy-MM-dd HH:mm:ss')}',
-    NULL,
-    '${load_type}',
-    CURRENT_TIMESTAMP
+    'success', ${executesql.row.count}, ${executesql.row.count}, 0, 0,
+    '${now():format('yyyy-MM-dd HH:mm:ss')}', NULL, '${load_type}', CURRENT_TIMESTAMP
 )
 ```
 
-> `${executesql.row.count}` là attribute tự động từ ExecuteSQL processor.
+> **Dùng explicit column list** (không INSERT theo vị trí) — an toàn khi schema thêm cột.
 
-**Connection:** `Write to MinIO Bronze` → success → `Build Execution Log SQL`
+**ExecuteSQL (`Insert Execution Log`)** trên `dremio-jdbc-pool`, query để trống.
 
-#### Processor: ExecuteSQL (Insert Log)
+**Connections:** `Write to MinIO Bronze` → `Build Execution Log SQL` → `Insert Execution Log`
 
-| Property                              | Value                             |
-|---------------------------------------|-----------------------------------|
-| **Name**                              | `Insert Execution Log`            |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool`              |
-| **SQL select query**                  | (để trống — lấy từ FlowFile)     |
+### 6.8 Output Port → Resolve Next
 
-**Connection:** `Build Execution Log SQL` → success → `Insert Execution Log`
+Tạo Output Port `to-resolver`. **Connection:** `Insert Execution Log` → success → `to-resolver`.
 
-### 5.10 Bronze Ingestion Flow Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  PG: [2] Bronze Ingestion                                            │
-│                                                                      │
-│  ┌──────────────┐                                                   │
-│  │ IN:          │                                                   │
-│  │ from-metadata│                                                   │
-│  └──────┬───────┘                                                   │
-│         │                                                           │
-│  ┌──────▼───────────────┐                                           │
-│  │ Route by Load Type   │                                           │
-│  │ (RouteOnAttribute)   │                                           │
-│  └──┬───────────────┬───┘                                           │
-│     │ full          │ incremental                                   │
-│     ▼               ▼                                               │
-│  ┌──────────┐  ┌────────────────┐                                  │
-│  │ Build    │  │ Get Last       │ (ExecuteSQL → Dremio)             │
-│  │ Full     │  │ Watermark      │                                  │
-│  │ Load SQL │  └────────┬───────┘                                  │
-│  │          │           │                                           │
-│  │(Replace  │  ┌────────▼───────┐                                  │
-│  │ Text)    │  │ Watermark to   │ (ConvertAvroToJSON)              │
-│  │          │  │ JSON           │                                  │
-│  └────┬─────┘  └────────┬───────┘                                  │
-│       │                 │                                           │
-│       │        ┌────────▼───────┐                                  │
-│       │        │ Extract        │ (EvaluateJsonPath)               │
-│       │        │ Watermark      │                                  │
-│       │        └────────┬───────┘                                  │
-│       │                 │                                           │
-│       │        ┌────────▼───────┐                                  │
-│       │        │ Build          │ (ReplaceText)                    │
-│       │        │ Incremental    │                                  │
-│       │        │ SQL            │                                  │
-│       │        └────────┬───────┘                                  │
-│       │                 │                                           │
-│       └────────┬────────┘                                           │
-│                │ (merge)                                            │
-│       ┌────────▼────────────────┐                                  │
-│       │ Execute Source Query    │ (ExecuteSQL → Source DB)          │
-│       │ (reads SQL from content)│                                  │
-│       └────────┬────────────────┘                                  │
-│                │ success                                            │
-│       ┌────────▼────────────────┐                                  │
-│       │ Set S3 Output Path     │ (UpdateAttribute)                 │
-│       │ s3.key = bronze/...    │                                  │
-│       └────────┬────────────────┘                                  │
-│                │                                                    │
-│       ┌────────▼────────────────┐                                  │
-│       │ Write to MinIO Bronze  │ (PutS3Object)                    │
-│       └────────┬────────────────┘                                  │
-│                │ success                                            │
-│       ┌────────▼────────────────┐                                  │
-│       │ Build Execution Log    │ (ReplaceText)                    │
-│       │ SQL                    │                                  │
-│       └────────┬────────────────┘                                  │
-│                │                                                    │
-│       ┌────────▼────────────────┐                                  │
-│       │ Insert Execution Log   │ (ExecuteSQL → Dremio)            │
-│       └────────────────────────┘                                  │
-└──────────────────────────────────────────────────────────────────────┘
-```
+> Lúc này FlowFile mang `pipeline_id` (bronze vừa xong) + `run_id` — vừa đủ để Resolve Next
+> tìm downstream.
 
 ---
 
-## 6. Process Group 3: Silver Transform Orchestrator
+## 7. Process Group [4]: Silver Transform Orchestrator
 
-### 6.1 Concept
+Silver **không di chuyển data qua NiFi**: NiFi đọc `transform_rules` từ Dremio, gửi SQL cho Dremio
+execute trực tiếp trên Iceberg. NiFi = orchestrator, Dremio = compute.
 
-Silver transform không di chuyển data qua NiFi. Thay vào đó:
-1. NiFi đọc `transform_rules` từ Dremio metadata
-2. NiFi gửi SQL lệnh cho Dremio execute
-3. Dremio chạy SQL trực tiếp trên data trong MinIO
+> **KHÔNG có GenerateFlowFile/CRON cho silver.** Silver được Resolve Next đánh thức sau khi bronze
+> success. FlowFile vào silver chỉ mang `run_id` + `next_pipeline_id` (= `SLV_*`) + `target_layer`.
 
-→ NiFi chỉ là **orchestrator**, Dremio là **compute engine**.
+Root canvas → Add PG → `[4] Silver Transform Orchestrator`. Kéo `[2] Stage Router` (`to-silver`)
+→ PG này. Mở PG. Tạo Input Port `from-router`.
 
-### 6.2 Tạo Process Group
+### 7.1 Processor: ExecuteSQL (Load Own Config)
 
-Root canvas → Add Process Group → Name: `[3] Silver Transform Orchestrator`
+Giống §6.1 nhưng dùng cho silver — nạp config **của chính silver** (`load_type`, `primary_keys`,
+`watermark_column`, `target_table` của tầng silver, độc lập với bronze):
 
-Connect `[1] Metadata Controller` output port `to-silver` → `[3] Silver Transform Orchestrator`
-
-### 6.3 Input Port
-
-Tạo Input Port: `from-metadata`
-
-> **Lưu ý:** Với thiết kế hiện tại, Metadata Controller route `target_layer = 'silver'` vào đây.
-> Nhưng Silver transform thường trigger SAU khi Bronze ingestion xong.
-> Có 2 cách:
-> 1. **Sequential:** Bronze xong → gửi signal → trigger Silver (phức tạp hơn)
-> 2. **Time-based:** Bronze chạy lúc 2h, Silver chạy lúc 3h (đơn giản, đủ dùng)
->
-> Ở đây ta dùng **Time-based**: tạo GenerateFlowFile riêng cho Silver với schedule lệch giờ.
-
-### 6.4 Processor: GenerateFlowFile (Silver Trigger)
-
-| Property               | Value                                     |
-|------------------------|-------------------------------------------|
-| **Name**               | `Trigger Silver Transforms`               |
-| **Scheduling Strategy**| `CRON_DRIVEN`                             |
-| **Schedule**           | `0 0 3 * * ?` (3h sáng, sau bronze 1h)   |
-| **Custom Text**        | `trigger_silver`                          |
-
-### 6.5 Processor: ExecuteSQL (Read Transform Rules)
-
-| Property                              | Value                                                                 |
-|---------------------------------------|-----------------------------------------------------------------------|
-| **Name**                              | `Read Silver Transform Rules`                                         |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool`                                                  |
-| **SQL select query**                  | (xem bên dưới)                                                        |
-
-**SQL Query:**
 ```sql
-SELECT
-    r.rule_id,
-    r.pipeline_id,
-    r.rule_name,
-    r.transform_type,
-    r.sql_template,
-    r.execution_order,
-    p.source_table,
-    p.target_table,
-    p.primary_keys,
-    p.watermark_column
+SELECT pipeline_id, pipeline_name, source_layer, source_table, target_table,
+       load_type, primary_keys, watermark_column, partition_columns
+FROM minio-datalake.metadata.pipeline_config
+WHERE pipeline_id = '${next_pipeline_id}'   -- vd 'SLV_transactions'
+  AND is_active = true
+```
+
+→ `ConvertAvroToJSON` → `EvaluateJsonPath` (extract `pipeline_id`, `pipeline_name`, `target_table`,
+`load_type`, `primary_keys`, `watermark_column`, `source_table`).
+
+**Connection:** `from-router` → `Load Own Config` → ...
+
+### 7.2 Processor: ExecuteSQL (Read Transform Rules)
+
+Khóa theo **pipeline_id của stage này** — lấy đúng rules của silver, không quét toàn bộ:
+
+```sql
+SELECT r.rule_id, r.rule_name, r.transform_type, r.sql_template, r.execution_order
 FROM minio-datalake.metadata.transform_rules r
-JOIN minio-datalake.metadata.pipeline_config p ON r.pipeline_id = p.pipeline_id
-WHERE r.source_layer = 'bronze'
-  AND r.target_layer = 'silver'
+WHERE r.pipeline_id = '${pipeline_id}'   -- = SLV_*
   AND r.is_active = true
-  AND p.is_active = true
-ORDER BY r.pipeline_id, r.execution_order
+ORDER BY r.execution_order
 ```
 
-**Connection:** `Trigger Silver Transforms` → success → `Read Silver Transform Rules`
+→ `ConvertAvroToJSON` (`Rules to JSON`) → `SplitJson` `$[*]` (`Split Per Rule`) →
+`EvaluateJsonPath` (`Extract Rule`: `rule_id`, `rule_name`, `transform_type`, `sql_template`).
 
-### 6.6 Convert + Split + Extract
+> SplitJson giữ nguyên attribute cha (`run_id`, `pipeline_id`, `target_table`...) cho mỗi rule.
+> Nhiều rule (create_table → dedup → merge) chạy tuần tự theo `execution_order`.
 
-Tương tự Metadata Controller:
+### 7.3 Incremental: Get Silver Watermark (nếu load_type = incremental)
 
-1. **ConvertAvroToJSON** → `Rules to JSON`
-2. **SplitJson** ($[*]) → `Split Per Transform Rule`
-3. **EvaluateJsonPath** → `Extract Rule Attributes`
+Giống bronze nhưng keyed theo **pipeline_id silver + layer='silver'**:
 
-**EvaluateJsonPath dynamic properties:**
-
-| Property         | Value                  |
-|------------------|------------------------|
-| `rule_id`        | `$.rule_id`            |
-| `pipeline_id`    | `$.pipeline_id`        |
-| `rule_name`      | `$.rule_name`          |
-| `transform_type` | `$.transform_type`     |
-| `sql_template`   | `$.sql_template`       |
-| `source_table`   | `$.source_table`       |
-| `target_table`   | `$.target_table`       |
-| `primary_keys`   | `$.primary_keys`       |
-| `watermark_column`| `$.watermark_column`  |
-
-### 6.7 Processor: ReplaceText (Render SQL Template)
-
-| Property                 | Value                                                |
-|--------------------------|------------------------------------------------------|
-| **Name**                 | `Render Transform SQL`                               |
-| **Search Value**         | `(?s)(^.*$)`                                         |
-| **Replacement Value**    | `${sql_template}`                                    |
-| **Replacement Strategy** | `Regex Replace`                                      |
-| **Evaluation Mode**      | `Entire text`                                        |
-
-> `${sql_template}` chứa SQL đã lưu trong metadata. Các biến `${source_table}`, `${target_table}`
-> trong sql_template sẽ được NiFi Expression Language resolve vì chúng cũng là attributes.
-
-### 6.8 Processor: ExecuteSQL (Run Transform on Dremio)
-
-| Property                              | Value                                   |
-|---------------------------------------|-----------------------------------------|
-| **Name**                              | `Execute Transform on Dremio`           |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool`                    |
-| **SQL select query**                  | (để trống — lấy từ FlowFile content)   |
-
-### 6.9 Log Execution (tương tự Bronze)
-
-Dùng `ReplaceText` + `ExecuteSQL` để INSERT vào `pipeline_execution_log`.
-
-### 6.10 Silver Flow Diagram
-
+```sql
+SELECT COALESCE(MAX(last_watermark), '1970-01-01 00:00:00') AS last_watermark
+FROM minio-datalake.metadata.pipeline_execution_log
+WHERE pipeline_id = '${pipeline_id}'   -- SLV_*
+  AND layer = 'silver'
+  AND status = 'success'
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  PG: [3] Silver Transform Orchestrator                       │
-│                                                              │
-│  ┌────────────────────────┐                                 │
-│  │ Trigger Silver         │ (CRON: 0 0 3 * * ?)            │
-│  │ Transforms             │                                 │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Read Silver Transform  │ (ExecuteSQL → Dremio)           │
-│  │ Rules                  │                                 │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Rules to JSON          │ (ConvertAvroToJSON)             │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Split Per Transform    │ (SplitJson)                     │
-│  │ Rule                   │                                 │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Extract Rule           │ (EvaluateJsonPath)              │
-│  │ Attributes             │                                 │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Render Transform SQL   │ (ReplaceText)                   │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Execute Transform on   │ (ExecuteSQL → Dremio)           │
-│  │ Dremio                 │                                 │
-│  └──────────┬─────────────┘                                 │
-│             │                                                │
-│  ┌──────────▼─────────────┐                                 │
-│  │ Log Execution          │ (ReplaceText + ExecuteSQL)      │
-│  └────────────────────────┘                                 │
-└──────────────────────────────────────────────────────────────┘
-```
+
+→ extract `last_watermark` thành attribute (dùng trong `sql_template` MERGE).
+
+### 7.4 Processor: ReplaceText (Render Transform SQL)
+
+| Property | Value |
+|----------|-------|
+| **Name** | `Render Transform SQL` |
+| **Search Value** | `(?s)(^.*$)` |
+| **Replacement Value** | `${sql_template}` |
+| **Replacement Strategy** | `Regex Replace` |
+| **Evaluation Mode** | `Entire text` |
+
+> `${sql_template}` chứa SQL trong metadata; các biến `${source_table}`, `${target_table}`,
+> `${primary_keys}`, `${watermark_column}`, `${last_watermark}` được Expression Language resolve
+> vì chúng đều là attribute (từ Load Own Config + Get Silver Watermark). Chi tiết template: Doc 12.
+
+### 7.5 Processor: ExecuteSQL (Run Transform on Dremio)
+
+`dremio-jdbc-pool`, query để trống (đọc từ content).
+
+### 7.6 Log Execution
+
+Giống §6.7 nhưng `layer = 'silver'` và `execution_params = '${load_type}'`. Vẫn explicit column list, kèm `run_id`.
+
+### 7.7 Output Port → Resolve Next
+
+Tạo Output Port `to-resolver`. **Connection:** `Insert Execution Log` → success → `to-resolver`.
+
+### 7.8 (Tùy chọn) DQ Checks
+
+Trước khi log success, chèn nhánh chạy `data_quality_rules` (WHERE pipeline_id = `${pipeline_id}`)
+→ ExecuteSQL trên Dremio → route theo `severity` (Doc 12 §5). Có thể bổ sung sau.
 
 ---
 
-## 7. Process Group 4: Gold Transform Orchestrator
+## 8. Process Group [5]: Gold Transform Orchestrator
 
-**Cấu trúc giống hệt Silver**, chỉ thay đổi:
+**Giống hệt Silver** (§7), chỉ khác:
+- `layer = 'gold'` trong log.
+- `target_layer` của các FlowFile đi vào đây là `gold` (đã route ở Stage Router).
+- Read Transform Rules vẫn `WHERE r.pipeline_id = '${pipeline_id}'` (= `GLD_*`) — config của stage
+  đã tự xác định `source_layer='silver'`, không cần điều kiện layer thủ công.
+- **Multi-parent** (gold phụ thuộc ≥ 2 silver): thêm Wait barrier ở đầu PG — xem §10.
 
-| Thay đổi                     | Silver                        | Gold                         |
-|------------------------------|-------------------------------|------------------------------|
-| Trigger schedule             | `0 0 3 * * ?`                | `0 0 4 * * ?` (4h sáng)     |
-| SQL WHERE clause             | `source_layer = 'bronze'`    | `source_layer = 'silver'`   |
-|                              | `target_layer = 'silver'`    | `target_layer = 'gold'`     |
-| Log layer                    | `'silver'`                   | `'gold'`                    |
-
-→ Copy toàn bộ PG Silver, rename thành `[4] Gold Transform Orchestrator`, sửa 3 chỗ trên.
+→ Copy PG Silver, rename `[5] Gold Transform Orchestrator`, sửa `layer` trong log. Kéo
+`[2] Stage Router` (`to-gold`) → PG này.
 
 ---
 
-## 8. Permanent JDBC Drivers (initContainer)
+## 9. Process Group [6]: Resolve Next Stages
 
-Để không mất driver khi pod restart, thêm initContainer vào NiFi StatefulSet:
+Trái tim của event-driven: sau khi MỘT stage success, tìm các stage phụ thuộc nó và đẩy chúng
+quay lại Stage Router.
 
-**File:** `napas-platform-infra/platform/charts/nifi/templates/statefulset.yaml`
+Root canvas → Add PG → `[6] Resolve Next Stages`. Kéo connection từ **cả ba** executor
+(`[3]/[4]/[5]` output port `to-resolver`) → PG này. Mở PG. Tạo Input Port `from-executor`.
 
-Thêm initContainers trước containers:
+### 9.1 Processor: ExecuteSQL (Find Downstream)
+
+`dremio-jdbc-pool`:
+
+```sql
+SELECT pipeline_id AS next_pipeline_id, target_layer
+FROM minio-datalake.metadata.pipeline_config
+WHERE is_active = true
+  AND ( depends_on = '${pipeline_id}'
+        OR depends_on LIKE '${pipeline_id},%'
+        OR depends_on LIKE '%,${pipeline_id}'
+        OR depends_on LIKE '%,${pipeline_id},%' )
+```
+
+**Connection:** `from-executor` → `Find Downstream`
+
+### 9.2 ConvertAvroToJSON → SplitJson → EvaluateJsonPath
+
+| Processor | Cấu hình |
+|-----------|----------|
+| `ConvertAvroToJSON` (`Downstream to JSON`) | One line per record |
+| `SplitJson` (`Split Per Downstream`) | `$[*]` |
+| `EvaluateJsonPath` (`Set Next Attrs`) | `next_pipeline_id` = `$.next_pipeline_id`, `target_layer` = `$.target_layer` |
+
+> `run_id` đi theo từ FlowFile của executor (giữ nguyên qua ExecuteSQL + Split). Nếu không có
+> downstream nào, SplitJson không sinh FlowFile con → nhánh kết thúc (stage lá). Tự nhiên, đúng ý.
+
+### 9.3 Output Port → loop về Router
+
+Tạo Output Port `to-router`. **Connection:** `Set Next Attrs` (split) → `to-router`.
+Ngoài root canvas: kéo `[6] Resolve Next Stages` (`to-router`) → `[2] Stage Router` (`from-upstream`).
+
+→ Vòng lặp khép kín: Router phân phối, executor xử lý, Resolve Next tìm bước kế, lặp tới hết DAG.
+
+---
+
+## 10. (Nâng Cao) Fan-in: Stage Có Nhiều Parent
+
+Bỏ qua mục này nếu DAG của bạn mỗi stage chỉ 1 parent (cây/tuyến tính).
+
+**Vấn đề:** `GLD_bank_kpis` phụ thuộc `SLV_transactions` VÀ `SLV_merchants`. Khi mỗi silver xong,
+Resolve Next sẽ tạo **một** FlowFile cho gold → gold bị trigger 2 lần. Cần **barrier**: gold chỉ
+chạy **một lần**, sau khi **tất cả** parent xong.
+
+### 10.1 Controller Services
+
+Tạo `DistributedMapCacheServer` (`dmc-server`, port mặc định 4557) và
+`DistributedMapCacheClientService` (`dmc-client`, Server Hostname = `localhost`). Enable cả hai.
+
+### 10.2 Notify (trong Resolve Next)
+
+Sau `Set Next Attrs`, thêm processor **Notify** trước Output Port:
+
+| Property | Value |
+|----------|-------|
+| **Name** | `Notify Downstream Ready` |
+| **Release Signal Identifier** | `${run_id}__${next_pipeline_id}` |
+| **Signal Counter Name** | `${pipeline_id}` |
+| **Distributed Cache Service** | `dmc-client` |
+
+**Connection:** `Set Next Attrs` → `Notify Downstream Ready` → `to-router`.
+
+### 10.3 DetectDuplicate + Wait (đầu PG Gold)
+
+Trong `[5] Gold`, **trước** `Load Own Config`:
+
+**DetectDuplicate (`Dedup Gold Trigger`)** — đảm bảo mỗi (run_id, gold) chỉ 1 FlowFile qua Wait:
+
+| Property | Value |
+|----------|-------|
+| **Cache Entry Identifier** | `${run_id}__${next_pipeline_id}` |
+| **Distributed Cache Service** | `dmc-client` |
+| **Age Off Duration** | `12 hours` |
+
+→ relationship `non-duplicate` → Wait; `duplicate` → auto-terminate.
+
+**Wait (`Wait All Parents`):**
+
+| Property | Value |
+|----------|-------|
+| **Release Signal Identifier** | `${run_id}__${next_pipeline_id}` |
+| **Target Signal Count** | `${depends_on:replaceAll('[^,]','') :length():plus(1)}` |
+| **Distributed Cache Service** | `dmc-client` |
+| **Expiration Duration** | `1 hour` |
+
+> **Target Signal Count** = số parent = (số dấu phẩy trong `depends_on`) + 1. Cần load
+> `depends_on` vào attribute trước (thêm vào query Load Own Config). `Wait` chỉ nhả FlowFile (đã
+> dedup) khi đủ số parent Notify; hết `Expiration` → route `expired` → alert.
+
+**Connection:** `from-router` → `Dedup Gold Trigger` → (non-duplicate) → `Wait All Parents` → (success) → `Load Own Config`.
+
+---
+
+## 11. Permanent JDBC Drivers (initContainer)
+
+Để không mất driver khi pod restart, thêm initContainer vào NiFi StatefulSet
+(`napas-platform-infra/platform/charts/nifi/templates/statefulset.yaml`):
 
 ```yaml
 initContainers:
@@ -813,60 +656,54 @@ initContainers:
     command: ["sh", "-c"]
     args:
       - |
-        curl -L -o /drivers/postgresql-42.7.2.jar \
-          "https://jdbc.postgresql.org/download/postgresql-42.7.2.jar"
-        curl -L -o /drivers/dremio-jdbc-driver-24.3.2.jar \
-          "https://download.dremio.com/jdbc-driver/24.3.2/dremio-jdbc-driver-24.3.2-202401241530580032-1f14e76d.jar"
-        ls -la /drivers/
+        curl -L -o /drivers/postgresql-42.7.2.jar "https://jdbc.postgresql.org/download/postgresql-42.7.2.jar"
+        curl -L -o /drivers/dremio-jdbc-driver-24.3.2.jar "https://download.dremio.com/jdbc-driver/24.3.2/dremio-jdbc-driver-24.3.2-202401241530580032-1f14e76d.jar"
     volumeMounts:
-      - name: jdbc-drivers
-        mountPath: /drivers
+      - { name: jdbc-drivers, mountPath: /drivers }
+# container nifi: thêm volumeMount /opt/nifi/nifi-current/drivers (name: jdbc-drivers)
+# volumes: - { name: jdbc-drivers, emptyDir: {} }
 ```
 
-Thêm volumeMount vào container NiFi:
-
-```yaml
-containers:
-  - name: nifi
-    volumeMounts:
-      - name: jdbc-drivers
-        mountPath: /opt/nifi/nifi-current/drivers
-        # Cập nhật NiFi để scan thêm /drivers:
-        # Hoặc copy vào /lib trong command
-```
-
-Thêm volume:
-
-```yaml
-volumes:
-  - name: jdbc-drivers
-    emptyDir: {}
-```
-
-> **Alternative đơn giản hơn:** Dùng PVC để mount drivers, hoặc build custom NiFi image chứa sẵn drivers.
+> **Alternative:** build custom NiFi image chứa sẵn drivers, hoặc PVC mount.
 
 ---
 
-## 9. Checklist Kiểm Tra
+## 12. Migration Từ v1.0 (nếu đã build theo bản cũ)
 
-Sau khi setup xong, verify từng bước:
+Nếu bạn đã build Controller + Bronze theo time-based v1.0:
 
-- [ ] Dremio JDBC driver có trong NiFi `/lib/` hoặc `/drivers/`
-- [ ] PostgreSQL JDBC driver có trong NiFi
-- [ ] Controller Service `dremio-jdbc-pool` → **ENABLED**, test connection thành công
-- [ ] Controller Service `source-postgres-pool` → **ENABLED**, test connection thành công
-- [ ] PG [1] Metadata Controller: trigger manual → thấy FlowFiles split ra đúng số table
-- [ ] PG [2] Bronze Ingestion: full load → data xuất hiện trong MinIO `bronze/`
-- [ ] PG [2] Bronze Ingestion: incremental → chỉ lấy records mới
-- [ ] PG [3] Silver Transform: Dremio tạo/update Iceberg tables trong `silver/`
-- [ ] PG [4] Gold Transform: Dremio tạo views/tables trong `gold/`
-- [ ] `pipeline_execution_log` có records mới sau mỗi lần chạy
+| # | Việc | Chi tiết |
+|---|------|----------|
+| 1 | ALTER schema | Thêm `dataset, source_layer, depends_on` vào `pipeline_config`; `run_id` vào `pipeline_execution_log` (Doc 10 §3) |
+| 2 | Tách config | Mỗi dataset → row `BRZ_*/SLV_*/GLD_*` riêng + set `depends_on`; re-point `transform_rules/column_mapping/dq_rules.pipeline_id` sang stage sở hữu (Doc 10 §4.5) |
+| 3 | Controller | Thêm `Generate Run ID` (§4.2); đổi SQL sang `WHERE depends_on IS NULL` (§4.3); bỏ route-by-layer-3-port, thay bằng `to-router` |
+| 4 | Bronze | Thêm `Load Own Config` ở đầu (§6.1); sửa Log SQL sang explicit column list + `run_id` (§6.7); thêm `to-resolver` |
+| 5 | **Xóa** | GenerateFlowFile CRON của Silver/Gold (`0 0 3 * * ?`, `0 0 4 * * ?`) — không còn dùng |
+| 6 | Build mới | Stage Router (§5), Silver sửa lại (§7), Gold (§8), Resolve Next (§9), Wait/Notify nếu cần (§10) |
 
 ---
 
-## 10. Tài Liệu Tiếp Theo
+## 13. Checklist Kiểm Tra
+
+- [ ] JDBC drivers (Dremio + PostgreSQL) có trong NiFi `/lib`
+- [ ] Controller Services enabled: `dremio-jdbc-pool`, `source-postgres-pool`, record services (+ `dmc-server`/`dmc-client` nếu fan-in)
+- [ ] Metadata: mỗi stage 1 row, `depends_on` đúng; root có `depends_on IS NULL`
+- [ ] `transform_rules`/`column_mapping`/`dq_rules` trỏ đúng `pipeline_id` của stage sở hữu
+- [ ] PG[1] Controller: sinh `run_id`, đọc đúng roots, ra `to-router`
+- [ ] PG[2] Stage Router: route bronze/silver/gold đúng
+- [ ] PG[3] Bronze: full + incremental ra MinIO `bronze/`; log có `run_id`
+- [ ] PG[4]/[5] Silver/Gold: Load Own Config đúng stage; Dremio tạo/update Iceberg
+- [ ] PG[6] Resolve Next: bronze success → tự đánh thức silver → gold (theo run_id)
+- [ ] `pipeline_execution_log`: cùng `run_id`, đủ 3 layer, đúng `pipeline_id` riêng từng stage
+- [ ] (Fan-in) gold multi-parent chỉ chạy 1 lần sau khi đủ parent
+
+---
+
+## 14. Tài Liệu Tiếp Theo
 
 | Bước | Doc | Mô tả |
 |------|-----|-------|
-| Chi tiết SQL | [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) | Tất cả SQL templates cho mọi transform type |
+| Chiến lược (why) | [14-pipeline-dependency-orchestration.md](14-pipeline-dependency-orchestration.md) | Lý do & thiết kế event-driven |
+| Chi tiết SQL | [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) | SQL templates bronze/silver/gold |
 | Vận hành | [13-pipeline-operations-runbook.md](13-pipeline-operations-runbook.md) | Thêm bảng, monitor, troubleshoot |
+</content>
