@@ -95,12 +95,18 @@ CREATE TABLE "minio-datalake"."metadata".pipeline_config (
     depends_on          VARCHAR,
     batch_size          INT,
     schedule_cron       VARCHAR,
+    priority            INT,
     is_active           BOOLEAN,
     description         VARCHAR,
     created_at          TIMESTAMP,
     updated_at          TIMESTAMP
 );
 ```
+
+> **Lịch chạy (root/bronze):** Controller **tick mỗi phút** và lọc bảng **đến giờ** theo
+> `schedule_cron` của chính nó (parse `min hour dom mon dow` bằng SQL) ⇒ mỗi bảng chạy đúng giờ
+> riêng, không bị gom về 1 mốc. `priority` (số nhỏ = ưu tiên cao, mặc định 100) dùng để xếp thứ tự
+> khi nhiều bảng cùng đến giờ. Cơ chế chống bottleneck: [11-nifi-dynamic-pipeline-setup.md](11-nifi-dynamic-pipeline-setup.md) §4.
 
 > **QUAN TRỌNG — Mô hình "1 stage = 1 config row":** Mỗi bước chuyển tầng
 > (`source→bronze`, `bronze→silver`, `silver→gold`) là **một dòng riêng** với
@@ -130,7 +136,8 @@ CREATE TABLE "minio-datalake"."metadata".pipeline_config (
 | `partition_columns`| VARCHAR  | Cột partition (comma-separated, NULL nếu không partition)      | `transaction_date`                                  |
 | `depends_on`       | VARCHAR  | `pipeline_id` upstream (comma-separated). `NULL` = root/ingestion. Định nghĩa cạnh DAG | `BRZ_transactions` hoặc `SLV_txn,SLV_merchants` |
 | `batch_size`       | INT      | Số rows mỗi batch (NiFi fetch size)                           | `10000`                                             |
-| `schedule_cron`    | VARCHAR  | Lịch chạy                                                     | `0 2 * * *` (2h sáng mỗi ngày)                     |
+| `schedule_cron`    | VARCHAR  | Lịch chạy `min hour dom mon dow` (mỗi field `*` hoặc 1 số). Controller lọc bảng đến giờ theo field này | `0 2 * * *` (02:00 hằng ngày), `10 2 * * *` (02:10), `0 3 * * 1` (03:00 thứ Hai) |
+| `priority`         | INT      | Thứ tự ưu tiên khi nhiều bảng cùng đến giờ (nhỏ = trước; mặc định 100) | `10`, `100`                                |
 | `is_active`        | BOOLEAN  | Pipeline có đang active không                                  | `true`, `false`                                     |
 | `description`      | VARCHAR  | Mô tả pipeline                                                | `Ingest daily transactions from core banking`       |
 | `created_at`       | TIMESTAMP| Thời gian tạo                                                 | `2026-06-24 10:00:00`                               |
@@ -420,15 +427,15 @@ VALUES
 
 ('BRZ_merchants','bronze_merchants','merchants','jdbc','source-postgres-pool','public',
  'merchants','source','bronze','merchants','full','merchant_id',NULL,NULL,
- NULL, 5000,'0 2 * * *', true,'Full load merchant master'),
+ NULL, 5000,'10 2 * * *', true,'Full load merchant master'),
 
 ('BRZ_bank_codes','bronze_bank_codes','bank_codes','jdbc','source-postgres-pool','public',
  'bank_codes','source','bronze','bank_codes','full','bank_code',NULL,NULL,
- NULL, 1000,'0 2 * * 1', true,'Weekly full load bank reference'),
+ NULL, 1000,'0 3 * * 1', true,'Weekly full load bank reference'),
 
 ('BRZ_settlements','bronze_settlements','settlements','jdbc','source-postgres-pool','public',
  'settlements','source','bronze','settlements','incremental','settlement_id','settlement_date','settlement_date',
- NULL, 10000,'0 2 * * *', true,'Incremental ingest settlements'),
+ NULL, 10000,'20 2 * * *', true,'Incremental ingest settlements'),
 
 -- ===== SILVER STAGES: bronze → silver (config ĐỘC LẬP với bronze; depends_on = BRZ_*) =====
 ('SLV_transactions','silver_transactions','transactions','internal',NULL,NULL,

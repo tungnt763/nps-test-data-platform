@@ -175,16 +175,22 @@ Truy cập NiFi UI: `https://localhost:8444/nifi` → Controller Settings (gear)
 
 Right-click canvas → **Add Process Group** → `[1] Metadata Controller`. Double-click để mở.
 
-### 4.1 Processor: GenerateFlowFile (Trigger)
+### 4.1 Processor: GenerateFlowFile (Scheduler Tick — mỗi 60s)
+
+> **KHÔNG dùng 1 CRON cố định trigger tất cả bảng.** Vấn đề: CRON `0 0 2 * * ?` sẽ chạy **mọi**
+> root lúc 2h — bỏ qua `schedule_cron` riêng của từng bảng (bảng hẹn 3h vẫn chạy 2h), và bung tất
+> cả cùng lúc → bottleneck. Thay vào đó controller **tick đều mỗi phút**, rồi ở §4.3 **lọc đúng bảng
+> đến giờ** theo `schedule_cron` của chính nó.
 
 | Property               | Value                                     |
 |------------------------|-------------------------------------------|
-| **Name**               | `Trigger Pipeline Run`                    |
-| **Scheduling Strategy**| `CRON_DRIVEN`                             |
-| **Schedule**           | `0 0 2 * * ?` (2h sáng mỗi ngày)         |
-| **Custom Text**        | `trigger`                                 |
+| **Name**               | `Scheduler Tick`                          |
+| **Scheduling Strategy**| `TIMER_DRIVEN`                            |
+| **Run Schedule**       | `60 sec`                                  |
+| **Custom Text**        | `tick`                                    |
 
-> **Test:** tạm dùng `Timer Driven` `60 sec`, hoặc Right-click → **Run Once**.
+> Tick mỗi phút rất nhẹ (chỉ 1 query metadata nhỏ). Muốn độ phân giải khác (vd 30s) thì chỉnh
+> Run Schedule; cron của bảng nên dùng độ phân giải ≥ tick.
 
 ### 4.2 Processor: UpdateAttribute (Generate Run ID) — MỚI
 
@@ -195,31 +201,48 @@ Sinh **một** `run_id` cho cả lần chạy; nó sẽ propagate xuống mọi 
 | **Name**  | `Generate Run ID`                                                 |
 | `run_id`  | `RUN_${now():format('yyyyMMddHHmmss')}_${UUID():substring(0,8)}`  |
 
-**Connection:** `Trigger Pipeline Run` → success → `Generate Run ID`
+**Connection:** `Scheduler Tick` → success → `Generate Run ID`
 
-### 4.3 Processor: ExecuteSQL (Read Root Pipelines)
+### 4.3 Processor: ExecuteSQL (Read **Due** Root Pipelines)
 
-Chỉ đọc **root** (`depends_on IS NULL`) — tức các bronze ingestion. Silver/gold KHÔNG đọc ở đây;
-chúng được Resolve Next đánh thức.
+Chỉ đọc root (`depends_on IS NULL`) **đến giờ ở phút hiện tại** theo `schedule_cron` của **chính
+bảng đó**. Parse cron `min hour dom mon dow` bằng `SPLIT_PART` (hỗ trợ `*` hoặc số nguyên mỗi field —
+đủ cho daily/weekly/monthly). Mỗi bảng chạy đúng giờ riêng ⇒ bảng hẹn 3h **không** bị chạy lúc 2h.
 
-| Property                       | Value                  |
-|--------------------------------|------------------------|
-| **Name**                       | `Read Root Pipelines`  |
-| **Database Connection Pooling Service** | `dremio-jdbc-pool` |
-| **SQL select query**           | (xem dưới)             |
+| Property                       | Value                       |
+|--------------------------------|-----------------------------|
+| **Name**                       | `Read Due Root Pipelines`   |
+| **Database Connection Pooling Service** | `dremio-jdbc-pool`  |
+| **SQL select query**           | (xem dưới)                  |
 
 ```sql
-SELECT pipeline_id, target_layer
-FROM "minio-datalake"."metadata".pipeline_config
+SELECT pipeline_id, target_layer, priority
+FROM "minio-datalake"."metadata".pipeline_config pc
 WHERE is_active = true
   AND depends_on IS NULL
-ORDER BY pipeline_id
+  -- Khớp cron 'min hour dom mon dow' với thời điểm hiện tại (mỗi field: '*' hoặc số)
+  AND (SPLIT_PART(schedule_cron,' ',1) = '*' OR CAST(SPLIT_PART(schedule_cron,' ',1) AS INT) = EXTRACT(MINUTE FROM CURRENT_TIMESTAMP))
+  AND (SPLIT_PART(schedule_cron,' ',2) = '*' OR CAST(SPLIT_PART(schedule_cron,' ',2) AS INT) = EXTRACT(HOUR   FROM CURRENT_TIMESTAMP))
+  AND (SPLIT_PART(schedule_cron,' ',3) = '*' OR CAST(SPLIT_PART(schedule_cron,' ',3) AS INT) = EXTRACT(DAY    FROM CURRENT_TIMESTAMP))
+  AND (SPLIT_PART(schedule_cron,' ',4) = '*' OR CAST(SPLIT_PART(schedule_cron,' ',4) AS INT) = EXTRACT(MONTH  FROM CURRENT_TIMESTAMP))
+  AND (SPLIT_PART(schedule_cron,' ',5) = '*' OR CAST(SPLIT_PART(schedule_cron,' ',5) AS INT) = (DAYOFWEEK(CURRENT_TIMESTAMP) - 1))
+  -- GUARD chống trigger trùng trong cùng phút (xem §4.6)
+  AND NOT EXISTS (
+      SELECT 1 FROM "minio-datalake"."metadata".pipeline_execution_log l
+      WHERE l.pipeline_id = pc.pipeline_id
+        AND l.layer = 'bronze'
+        AND l.start_time >= CURRENT_TIMESTAMP - INTERVAL '90' SECOND
+  )
+ORDER BY priority, pipeline_id
 ```
 
-> Chỉ cần `pipeline_id` + `target_layer` cho việc routing — config đầy đủ sẽ được
-> executor tự nạp ở bước "Load Own Config".
+> - Cron dùng convention chuẩn: field 5 (dow) `0=Chủ nhật..6=Thứ Bảy`; Dremio `DAYOFWEEK` trả
+>   `1=CN..7=T7` nên trừ 1. `'0 3 * * 1'` = 03:00 thứ Hai.
+> - Chỉ hỗ trợ `*` hoặc **một số** mỗi field (không `*/5`, `1-5`, `1,3`). Cần cron đầy đủ → xem
+>   "Alternative" cuối §4.6.
+> - Nếu tick rỗng (không bảng nào đến giờ) → SplitJson không sinh FlowFile → tick kết thúc, vô hại.
 
-**Connection:** `Generate Run ID` → success → `Read Root Pipelines`
+**Connection:** `Generate Run ID` → success → `Read Due Root Pipelines`
 
 ### 4.4 ConvertAvroToJSON → SplitJson → EvaluateJsonPath
 
@@ -227,16 +250,102 @@ ORDER BY pipeline_id
 |-----------|----------|
 | `ConvertAvroToJSON` (`Config to JSON`) | JSON Format = `One line per Avro record` |
 | `SplitJson` (`Split Per Root`) | JsonPath Expression = `$[*]` |
-| `EvaluateJsonPath` (`Set Correlation Attrs`) | Destination = `flowfile-attribute`; `next_pipeline_id` = `$.pipeline_id`, `target_layer` = `$.target_layer` |
+| `EvaluateJsonPath` (`Set Correlation Attrs`) | Destination = `flowfile-attribute`; `next_pipeline_id` = `$.pipeline_id`, `target_layer` = `$.target_layer`, `priority` = `$.priority` |
 
 > `run_id` đã là attribute (set ở §4.2) nên tự đi theo qua Split. Sau bước này mỗi FlowFile mang:
-> `run_id`, `next_pipeline_id`, `target_layer`.
+> `run_id`, `next_pipeline_id`, `target_layer`, `priority`.
 
-**Connections:** `Read Root Pipelines` → `Config to JSON` → `Split Per Root` (split) → `Set Correlation Attrs`
+**Connections:** `Read Due Root Pipelines` → `Config to JSON` → `Split Per Root` (split) → `Set Correlation Attrs`
 
-### 4.5 Output Port
+### 4.5 (Guard) Ghi log `queued` + Output Port
 
-Tạo Output Port `to-router`. **Connection:** `Set Correlation Attrs` → matched → `to-router`.
+**Trước** khi đẩy ra router, ghi một dòng `execution_log` trạng thái `queued` cho mỗi bảng vừa chọn —
+đây chính là nguồn cho GUARD ở §4.3 (lần tick sau thấy bảng đã được trigger ⇒ không trigger lại).
+
+`ReplaceText` (`Build Queued Log SQL`) → `ExecuteSQL` (`Insert Queued Log`, `dremio-jdbc-pool`):
+
+```sql
+INSERT INTO "minio-datalake"."metadata".pipeline_execution_log
+(execution_id, run_id, pipeline_id, pipeline_name, layer, status, execution_params, start_time)
+VALUES ('${next_pipeline_id}_${now():format('yyyyMMddHHmmss')}', '${run_id}', '${next_pipeline_id}',
+        '${next_pipeline_id}', 'bronze', 'queued', 'scheduled',
+        CAST('${now():format('yyyy-MM-dd HH:mm:ss')}' AS TIMESTAMP))
+```
+
+Tạo Output Port `to-router`. **Connection:** `Set Correlation Attrs` → `Build Queued Log SQL` →
+`Insert Queued Log` → `to-router`.
+
+> Bronze (§6.7) khi xong sẽ INSERT dòng `success` riêng; dòng `queued` đủ để guard hoạt động ngay
+> trong cùng phút (kể cả khi tick lỡ chạy 2 lần). Đơn giản hơn nếu chấp nhận rủi ro nhỏ: bỏ bước này,
+> guard chỉ dựa trên log `success`/`running` — nhưng nên giữ để chắc chắn không trùng.
+
+### 4.6 Chống Bottleneck — Throttle Concurrency
+
+Khi **nhiều bảng cùng đến giờ** (vd 50 bảng đều `0 2 * * *`), không để chúng bung một lúc làm nghẽn
+source DB / NiFi / Dremio. Ba lớp bảo vệ (kết hợp):
+
+1. **Stagger lịch (lớp 1):** đặt `schedule_cron` lệch phút nhau (`0 2`, `10 2`, `20 2`, ...) — phân
+   tán tự nhiên (Doc 10 §4.1).
+2. **Backpressure (lớp 2):** trên connection `[2] Stage Router` (`to-bronze`) → `[3] Bronze`, đặt
+   **Back Pressure Object Threshold** = `5` (hoặc theo sức chứa). Controller có bơm nhiều FlowFile thì
+   chúng **xếp hàng**, không tràn xuống bronze.
+3. **Concurrent Tasks (lớp 3):** processor `Execute Source Query` (§6.5) đặt **Concurrent Tasks** =
+   `3` → tối đa 3 bảng kéo source song song; phần còn lại chờ trong queue rồi rút dần.
+
+**Ưu tiên thứ tự:** trên queue vào bronze, dùng **PriorityAttributePrioritizer** với attribute
+`priority` (số nhỏ chạy trước) → bảng quan trọng đi trước khi đông.
+
+> Kết quả: tất cả bảng đến giờ **vẫn chạy hết**, nhưng theo từng đợt N-cái-một ⇒ không bottleneck.
+> Backpressure + Concurrent Tasks là van an toàn ngay cả khi lịch trùng.
+
+> **Alternative (cron đầy đủ):** cần `*/15`, `1-5`, `1,3,5`... thì thay query SPLIT_PART ở §4.3 bằng
+> `ExecuteScript` (Groovy + thư viện `cron-utils`) đánh giá `schedule_cron` so với thời điểm hiện tại.
+> Đắt hơn (cần thêm jar) nhưng hỗ trợ cron đầy đủ.
+
+### 4.7 Flow Diagram — Controller
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  PG: [1] Metadata Controller                                                   │
+│                                                                                │
+│  ┌────────────────────┐                                                        │
+│  │ Scheduler Tick     │  GenerateFlowFile · TIMER 60s · text="tick"            │
+│  │ (mỗi 60 giây)      │                                                        │
+│  └─────────┬──────────┘                                                        │
+│            │ success                                                           │
+│  ┌─────────▼──────────┐                                                        │
+│  │ Generate Run ID    │  UpdateAttribute · run_id=RUN_<ts>_<uuid8>             │
+│  └─────────┬──────────┘                                                        │
+│            │ success                                                           │
+│  ┌─────────▼─────────────────────────┐                                        │
+│  │ Read DUE Root Pipelines           │  ExecuteSQL → Dremio                    │
+│  │ • depends_on IS NULL              │  • khớp schedule_cron với phút hiện tại │
+│  │ • SPLIT_PART(cron) = now fields   │  • GUARD: NOT EXISTS log ≤ 90s          │
+│  │ • ORDER BY priority               │  → 0 dòng nếu chưa tới giờ (tick nghỉ)  │
+│  └─────────┬─────────────────────────┘                                        │
+│            │ success (mảng config đến giờ)                                     │
+│  ┌─────────▼──────────┐   ┌──────────────────┐   ┌───────────────────────────┐│
+│  │ Config to JSON     │──▶│ Split Per Root   │──▶│ Set Correlation Attrs     ││
+│  │ (ConvertAvroToJSON)│   │ (SplitJson $[*]) │   │ next_pipeline_id,         ││
+│  └────────────────────┘   └──────────────────┘   │ target_layer, priority    ││
+│                                                   └─────────────┬─────────────┘│
+│                                                        (mỗi bảng = 1 FlowFile) │
+│  ┌─────────────────────────────────┐                           │              │
+│  │ Insert Queued Log (GUARD)       │◀──────────────────────────┘              │
+│  │ ExecuteSQL · status='queued'    │  → để tick sau không trigger trùng       │
+│  └─────────┬───────────────────────┘                                          │
+│            │ success                                                           │
+│  ┌─────────▼──────────┐                                                        │
+│  │ OUT: to-router     │  (BackPressure Object Threshold = 5 ở connection sau)  │
+│  └─────────┬──────────┘                                                        │
+└────────────┼───────────────────────────────────────────────────────────────┘
+             │  →  [2] Stage Router (Concurrent Tasks + Priority điều tiết tải)
+             ▼
+```
+
+**Tóm tắt cơ chế:** tick đều mỗi phút → **chỉ** bảng đến giờ (theo cron riêng) được chọn → guard
+chặn trùng → mỗi bảng thành 1 FlowFile mang `run_id` → ghi `queued` → ra router. Backpressure +
+Concurrent Tasks ở hạ nguồn rải tải, tránh bottleneck khi nhiều bảng trùng giờ.
 
 ---
 

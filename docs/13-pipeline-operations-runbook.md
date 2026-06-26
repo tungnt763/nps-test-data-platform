@@ -137,7 +137,9 @@ INSERT INTO "minio-datalake"."metadata".data_quality_rules VALUES
  'COUNT(*) = COUNT(DISTINCT ${column})', 'error', 0.0, true, 'PK must be unique');
 ```
 
-**Bước 7 — Test:** Trigger NiFi pipeline manually (Right-click `Trigger Pipeline Run` → Run Once)
+**Bước 7 — Test:** Controller lọc theo lịch nên muốn chạy ngay 1 bảng: tạm set
+`schedule_cron = '* * * * *'` (mỗi phút) cho bảng đó → tick kế tiếp sẽ bắt; xong nhớ revert. (Hoặc
+dùng `* <giờ-phút hiện tại>`.) Theo dõi data đổ vào MinIO `bronze/` và `execution_log`.
 
 **Bước 8 — Verify:**
 ```sql
