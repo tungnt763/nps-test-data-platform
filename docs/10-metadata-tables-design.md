@@ -13,9 +13,10 @@ NiFi đọc các bảng này qua JDBC để biết cần ingest bảng nào, tra
 
 ```
 metadata (Iceberg namespace trong Dremio)
-├── pipeline_config          ← Bảng chính: source, target, load type
+├── pipeline_config          ← Bảng chính: source, target, load type, depends_on
 ├── column_mapping           ← Column-level: tên cột, kiểu dữ liệu, transform
-├── transform_rules          ← SQL templates cho silver/gold
+├── transform_templates      ← Thư viện SQL GENERIC reusable (load/dedup/merge...) — dùng chung mọi bảng
+├── transform_rules          ← CHỈ bước custom (gold aggregation, filter đặc biệt)
 ├── data_quality_rules       ← Quy tắc DQ check
 └── pipeline_execution_log   ← Lịch sử chạy pipeline
 ```
@@ -181,6 +182,12 @@ CREATE TABLE "minio-datalake"."metadata".column_mapping (
 
 ### 3.3 transform_rules — Quy tắc transform silver/gold
 
+> **Khi nào cần transform_rules?** Luồng silver chuẩn (load→dedup→publish) **KHÔNG cần** rule riêng
+> cho từng bảng — NiFi áp **thư viện template generic** trong `transform_templates` (§3.6) dựa trên
+> `pipeline_config.load_type` + `column_mapping`. `transform_rules` chỉ dùng cho bước **custom**
+> (aggregation gold, filter đặc biệt), trỏ tới 1 template generic qua `template_id` **hoặc** chứa
+> `sql_template` riêng.
+
 ```sql
 CREATE TABLE "minio-datalake"."metadata".transform_rules (
     rule_id             VARCHAR,
@@ -189,7 +196,8 @@ CREATE TABLE "minio-datalake"."metadata".transform_rules (
     source_layer        VARCHAR,
     target_layer        VARCHAR,
     transform_type      VARCHAR,
-    sql_template        VARCHAR,
+    template_id         VARCHAR,    -- FK → transform_templates (generic). NULL nếu dùng sql_template riêng
+    sql_template        VARCHAR,    -- chỉ dùng cho custom; NULL nếu dùng template_id
     depends_on          VARCHAR,
     execution_order     INT,
     is_active           BOOLEAN,
@@ -203,11 +211,12 @@ CREATE TABLE "minio-datalake"."metadata".transform_rules (
 |-------------------|--------------------------------------------------------------|------------------------------------------|
 | `rule_id`         | ID duy nhất                                                  | `T001`                                   |
 | `pipeline_id`     | FK → pipeline_config (**stage sở hữu rule**: silver/gold)    | `SLV_transactions`, `GLD_daily_txn`      |
-| `rule_name`       | Tên rule                                                     | `dedup_transactions`                     |
+| `rule_name`       | Tên rule                                                     | `daily_txn_summary`                      |
 | `source_layer`    | Layer nguồn                                                  | `bronze`, `silver`                       |
 | `target_layer`    | Layer đích                                                   | `silver`, `gold`                         |
-| `transform_type`  | Loại transform                                               | `dedup`, `merge`, `aggregate`, `filter`, `create_table`, `custom` |
-| `sql_template`    | SQL template với biến `${variable}`                          | Xem phần SQL Templates bên dưới          |
+| `transform_type`  | Loại transform                                               | `load_stage`, `dedup`, `merge`, `aggregate`, `custom` |
+| `template_id`     | FK → `transform_templates` (dùng SQL generic, reusable)      | `T_MERGE`                                |
+| `sql_template`    | SQL custom riêng (chỉ khi không dùng template_id)            | aggregation gold                         |
 | `depends_on`      | Rule IDs phải chạy trước (comma-separated, NULL nếu không)  | `T001,T002`                              |
 | `execution_order` | Thứ tự chạy (nhỏ chạy trước)                                | `1`, `2`, `3`                            |
 | `is_active`       | Rule có active không                                         | `true`                                   |
@@ -339,6 +348,52 @@ CREATE TABLE "minio-datalake"."metadata".pipeline_execution_log (
 
 ---
 
+### 3.6 transform_templates — Thư viện template GENERIC (reusable)
+
+Lưu **một lần** các SQL template generic (chỉ chứa `${...}`, không hardcode tên bảng/cột). Mọi
+pipeline dùng chung → không lặp lại SQL cho từng bảng. Chi tiết SQL: [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3.
+
+```sql
+CREATE TABLE "minio-datalake"."metadata".transform_templates (
+    template_id     VARCHAR,    -- T_LOAD_STAGE, T_DEDUP, T_ENSURE_TARGET, T_MERGE, T_FULL_REPLACE, T_CLEANUP
+    transform_type  VARCHAR,    -- load_stage | dedup | create_table | merge | custom
+    sql_template    VARCHAR,    -- SQL generic, chỉ dùng biến ${...}
+    description     VARCHAR
+);
+```
+
+**Seed thư viện (dùng cho TẤT CẢ bảng):**
+
+```sql
+-- INSERT bỏ qua cột thời gian (không có ở bảng này); mỗi template chỉ chứa biến generic
+INSERT INTO "minio-datalake"."metadata".transform_templates
+(template_id, transform_type, sql_template, description)
+VALUES
+('T_LOAD_STAGE','load_stage',
+ 'CREATE TABLE ${stage_out} AS SELECT ${column_list_select} FROM ${source_fqn} ${where_clause}',
+ 'Nguồn → temp (full/incr + cast/clean)'),
+('T_DEDUP','dedup',
+ 'CREATE TABLE ${stage_out} AS SELECT ${column_list} FROM (SELECT ${column_list}, ROW_NUMBER() OVER (PARTITION BY ${primary_keys} ORDER BY ${order_by_clause}) AS _rn FROM ${stage_in}) WHERE _rn = 1',
+ 'Dedup temp → temp mới'),
+('T_ENSURE_TARGET','create_table',
+ 'CREATE TABLE IF NOT EXISTS ${target_fqn} AS SELECT ${column_list} FROM ${stage_in} WHERE 1=0',
+ 'Tạo bảng đích nếu chưa có'),
+('T_MERGE','merge',
+ 'MERGE INTO ${target_fqn} AS t USING ${stage_in} AS s ON ${merge_on_clause} WHEN MATCHED THEN UPDATE SET ${update_set_clause} WHEN NOT MATCHED THEN INSERT (${column_list}) VALUES (${insert_values_list})',
+ 'Upsert temp → bảng chính (incremental)'),
+('T_FULL_REPLACE','merge',
+ 'CREATE OR REPLACE TABLE ${target_fqn} AS SELECT ${column_list} FROM ${stage_in}',
+ 'Thay toàn bộ bảng chính (full-load)'),
+('T_CLEANUP','custom',
+ 'DROP TABLE IF EXISTS ${stage_drop}',
+ 'Drop 1 temp (lặp cho mọi temp của run)');
+```
+
+> **Lưu ý reusability:** không có dòng nào nhắc tên bảng/cột cụ thể. Onboard bảng mới = thêm
+> `pipeline_config` + `column_mapping`; thư viện này **không đổi**.
+
+---
+
 ## 4. Sample Data — Demo Pipeline
 
 ### 4.1 Pipeline Config cho demo (mô hình stage-tách)
@@ -438,87 +493,19 @@ VALUES
 ('M009','SLV_transactions','updated_at',       'updated_at',          'TIMESTAMP',      'CAST(${src} AS TIMESTAMP)',             false, true,  NULL, 9, 'Last update time');
 ```
 
-### 4.3 Transform Rules
+### 4.3 Transform Rules — CHỈ cho bước custom (gold). Silver chuẩn KHÔNG cần rule
 
-> `pipeline_id` của mỗi rule **trỏ tới stage sở hữu nó**. Silver dùng **pattern staging**: mỗi stage
-> silver có chuỗi rule `load_stage → dedup → ensure → merge` (thuộc `SLV_transactions`); gold
-> `aggregate` thuộc `GLD_daily_txn` / `GLD_bank_kpis`. `depends_on` trong transform_rules là thứ tự
-> **nội bộ một stage** (load→dedup→ensure→merge); phụ thuộc **giữa các stage** nằm ở
-> `pipeline_config.depends_on`. SQL templates đầy đủ: [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3.
+> **Silver chuẩn (load→dedup→publish) KHÔNG cần `transform_rules`.** NiFi tự dựng chuỗi từ thư viện
+> generic `transform_templates` (§3.6) theo `pipeline_config.load_type` + `column_mapping`
+> (xem [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3.7). Vì vậy `SLV_transactions`,
+> `SLV_merchants`, ... **không có** dòng nào ở đây.
+>
+> `transform_rules` chỉ chứa bước **custom**: aggregation gold (dùng `sql_template` riêng) hoặc filter
+> đặc biệt. Có thể trỏ `template_id` tới template generic nếu tái dùng được. `depends_on` = thứ tự
+> nội bộ stage; phụ thuộc giữa stage nằm ở `pipeline_config.depends_on`.
 
 ```sql
--- SILVER stage SLV_transactions — 4 rule theo pattern STAGING (load → dedup → ensure → merge)
-
--- (1) Stage Load: bronze → staging, áp cast/clean, lọc incremental theo watermark của silver
-INSERT INTO "minio-datalake"."metadata".transform_rules
-(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
- sql_template, depends_on, execution_order, is_active, description)
-VALUES (
-    'T001', 'SLV_transactions', 'stage_load_transactions',
-    'bronze', 'staging', 'load_stage',
-    'CREATE OR REPLACE TABLE "minio-datalake"."staging".transactions AS
-     SELECT
-       txn_id,
-       CAST(amount AS DECIMAL(18,2)) AS transaction_amount,
-       UPPER(TRIM(currency)) AS currency_code,
-       merchant_id,
-       LPAD(CAST(bank_code AS VARCHAR), 9, ''0'') AS bank_code,
-       status_code,
-       UPPER(transaction_type) AS transaction_type,
-       CAST(created_at AS TIMESTAMP) AS created_at,
-       CAST(updated_at AS TIMESTAMP) AS updated_at
-     FROM "minio-datalake"."bronze".transactions
-     WHERE created_at > ''${last_watermark}''',
-    NULL, 1, true,
-    'Load incremental bronze into staging with column transforms'
-);
-
--- (2) Dedup: khử trùng lặp NGAY TRÊN staging (ghi đè staging)
-INSERT INTO "minio-datalake"."metadata".transform_rules
-(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
- sql_template, depends_on, execution_order, is_active, description)
-VALUES (
-    'T002', 'SLV_transactions', 'dedup_transactions',
-    'staging', 'staging', 'dedup',
-    'CREATE OR REPLACE TABLE "minio-datalake"."staging".transactions AS
-     SELECT * EXCEPT (_row_num) FROM (
-       SELECT *,
-         ROW_NUMBER() OVER (PARTITION BY txn_id ORDER BY created_at DESC) AS _row_num
-       FROM "minio-datalake"."staging".transactions
-     ) WHERE _row_num = 1',
-    'T001', 2, true,
-    'Deduplicate staging, keep latest by created_at'
-);
-
--- (3) Ensure target: tạo silver nếu chưa có (schema khớp staging)
-INSERT INTO "minio-datalake"."metadata".transform_rules
-(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
- sql_template, depends_on, execution_order, is_active, description)
-VALUES (
-    'T003', 'SLV_transactions', 'ensure_silver_transactions',
-    'staging', 'silver', 'create_table',
-    'CREATE TABLE IF NOT EXISTS "minio-datalake"."silver".transactions AS
-     SELECT * FROM "minio-datalake"."staging".transactions WHERE 1=0',
-    'T002', 3, true,
-    'Create silver table if not exists'
-);
-
--- (4) Merge: upsert staging (đã dedup) → silver
-INSERT INTO "minio-datalake"."metadata".transform_rules
-(rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,
- sql_template, depends_on, execution_order, is_active, description)
-VALUES (
-    'T004', 'SLV_transactions', 'merge_transactions',
-    'staging', 'silver', 'merge',
-    'MERGE INTO "minio-datalake"."silver".transactions AS target
-     USING "minio-datalake"."staging".transactions AS source
-     ON target.txn_id = source.txn_id
-     WHEN MATCHED THEN UPDATE SET *
-     WHEN NOT MATCHED THEN INSERT *',
-    'T003', 4, true,
-    'Upsert staging into silver'
-);
-
+-- transform_rules CHỈ gồm gold custom aggregation (template_id = NULL → dùng sql_template riêng).
 -- Gold: Daily transaction summary (stage GLD_daily_txn)
 INSERT INTO "minio-datalake"."metadata".transform_rules
 (rule_id, pipeline_id, rule_name, source_layer, target_layer, transform_type,

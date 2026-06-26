@@ -38,6 +38,28 @@ Tất cả SQL templates dùng `${variable}` — được NiFi Expression Langua
 | `${src}`    | source_column  | `TXN_AMOUNT`   |
 | `${tgt}`    | target_column  | `transaction_amount` |
 
+### 1.4 Biến generic cho transform (NiFi build từ metadata — KHÔNG hardcode)
+
+Đây là nhóm biến giúp template **reusable cho mọi bảng** (không nhúng tên bảng/cột cứng):
+
+| Variable                | NiFi build từ | Ví dụ giá trị (đã resolve) |
+|-------------------------|---------------|-----------------------------|
+| `${run_token}`          | `run_id` (8 hex) | `a1b2c3d4`               |
+| `${source_fqn}`         | layer nguồn + source_table | `"minio-datalake"."bronze"."transactions"` |
+| `${target_fqn}`         | target_layer + target_table | `"minio-datalake"."silver"."transactions"` |
+| `${stage_in}`           | temp của step trước (hoặc source ở step 1) | `"minio-datalake"."staging"."transactions_temp_a1b2c3d4_1"` |
+| `${stage_out}`          | temp của step hiện tại | `"minio-datalake"."staging"."transactions_temp_a1b2c3d4_2"` |
+| `${column_list}`        | column_mapping → tên cột đích | `txn_id, transaction_amount, currency_code, ...` |
+| `${column_list_select}` | column_mapping → biểu thức cast/clean | `txn_id, CAST(amount AS DECIMAL(18,2)) AS transaction_amount, ...` |
+| `${update_set_clause}`  | column_mapping (cột non-PK) | `transaction_amount = s.transaction_amount, ...` |
+| `${insert_values_list}` | column_mapping → `s.<col>` | `s.txn_id, s.transaction_amount, ...` |
+| `${where_clause}`       | load_type | `''` (full) hoặc `WHERE created_at > TIMESTAMP '...'` (incremental) |
+| `${order_by_clause}`    | watermark_column hoặc PK | `created_at DESC` (hoặc `txn_id`) |
+| `${merge_on_clause}`    | primary_keys | `t.txn_id = s.txn_id` |
+
+> **Nguyên tắc:** template chỉ chứa `${...}`, **không tên bảng/cột cứng**, **không `SELECT *`**.
+> NiFi resolve tất cả từ `pipeline_config` + `column_mapping` lúc runtime (Doc 12 §6).
+
 ---
 
 ## 2. Bronze Layer — Ingestion Templates
@@ -112,145 +134,133 @@ WHERE CAST(${partition_columns} AS DATE) = CURRENT_DATE
 
 ---
 
-## 3. Silver Layer — Transform Templates (Staging Pattern)
+## 3. Silver Layer — Transform Templates (Generic + Per-Step Temp)
 
-Silver transforms chạy trên **Dremio**, orchestrate bởi NiFi (NiFi gửi SQL qua Dremio JDBC).
+Silver transforms chạy trên **Dremio**, orchestrate bởi NiFi. Thiết kế tối ưu cho **reusable**:
 
-> **Nguyên tắc: KHÔNG transform/merge trực tiếp từ bronze vào silver.** Mỗi lần chạy đi qua một
-> **bảng staging trung gian** (transient) trong schema `"minio-datalake"."staging"`:
->
-> ```
-> bronze ──(1) STAGE LOAD (full/incr + cast/clean)──▶ staging.${target_table}
->                                                          │
->                                          (2) DEDUP in place trên staging
->                                                          │
->                            (3) ENSURE target ──▶ (4) MERGE staging ──▶ silver.${target_table}
->                                                          │
->                                              (5) CLEANUP: drop staging
-> ```
->
-> **Vì sao đúng đắn hơn:** tách extract/filter (load) khỏi transform (dedup) khỏi publish (merge);
-> incremental chỉ kéo & dedup phần data mới rồi upsert; bảng silver chính không bao giờ ở trạng thái
-> dang dở; dễ retry từng bước; dễ debug (kiểm tra staging giữa chừng).
->
-> Các rule chạy theo `transform_rules.execution_order` trong **cùng một stage silver** (Doc 10 §4.3).
+- **Template generic, KHÔNG hardcode:** chỉ dùng `${...}` (Doc 12 §1.4); **cùng 1 template chạy cho
+  mọi bảng**. Tên bảng/cột do NiFi build từ `pipeline_config` + `column_mapping` (Doc 12 §6).
+- **KHÔNG `SELECT *`:** mọi bước liệt kê cột tường minh qua `${column_list}` / `${column_list_select}`.
+- **Mỗi step ghi ra MỘT temp table BẤT BIẾN riêng** trong schema `staging`, tên
+  `${target_table}_temp_${run_token}_${step}`. Step sau đọc temp của step trước (`${stage_in}`) và
+  ghi temp mới (`${stage_out}`). Bảng chính chỉ bị chạm ở **bước publish cuối**. **Cuối cùng drop
+  toàn bộ temp của run.**
 
-> **Chuẩn bị:** tạo schema/folder staging một lần (giống metadata):
-> `mc mb napas/napas-datalake/staging --ignore-existing` — Dremio tự tạo Iceberg table khi CTAS.
+> **Vì sao temp bất biến mỗi step** (thay vì `CREATE OR REPLACE` đè cùng 1 bảng): input mỗi bước bất
+> biến ⇒ retry/giám sát từng bước chính xác, không race/không khoá bảng đang đọc, debug được dữ liệu
+> tại **mọi** bước.
 
-### 3.1 Stage Load — Bronze → Staging (Full)
+> **Chuẩn bị:** tạo schema staging một lần: `mc mb napas/napas-datalake/staging --ignore-existing`.
 
-**Khi dùng:** load_type = `full`. Nạp toàn bộ bronze vào staging, áp luôn cast/clean từ `column_mapping`.
+### 3.0 Luồng & quy ước temp
 
-```sql
--- Template ID: SILVER_STAGE_LOAD_FULL
--- Transform type: load_stage  | execution_order: 1
+```
+run_token = a1b2c3d4 (8 hex từ run_id)   ;   ${target_table} = transactions
 
-CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
-SELECT ${column_select_list}
-FROM "minio-datalake"."bronze"."${source_table}"
+(1) LOAD            bronze.transactions      ─▶ staging.transactions_temp_a1b2c3d4_1
+(2) DEDUP           ..._temp_a1b2c3d4_1      ─▶ staging.transactions_temp_a1b2c3d4_2
+(3) MERGE/REPLACE   ..._temp_a1b2c3d4_2      ─▶ silver.transactions   (chạm bảng chính DUY NHẤT)
+(4) CLEANUP         DROP ..._temp_a1b2c3d4_1, ..._temp_a1b2c3d4_2
 ```
 
-### 3.2 Stage Load — Bronze → Staging (Incremental)
+`${stage_in}` / `${stage_out}` = FQN temp tương ứng; NiFi tự tính từ `run_token` + số step.
 
-**Khi dùng:** load_type = `incremental`. Chỉ nạp bronze rows mới hơn watermark của **chính silver**.
+### 3.1 T_LOAD_STAGE — nguồn → temp (generic; full & incremental)
+
+Một template duy nhất cho mọi bảng. `${where_clause}` rỗng khi full, hoặc `WHERE ...` khi incremental.
 
 ```sql
--- Template ID: SILVER_STAGE_LOAD_INCR
--- Transform type: load_stage  | execution_order: 1
-
-CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
-SELECT ${column_select_list}
-FROM "minio-datalake"."bronze"."${source_table}"
-WHERE ${watermark_column} > '${last_watermark}'
+-- Template ID: T_LOAD_STAGE   (reusable mọi bảng)
+CREATE TABLE ${stage_out} AS
+SELECT ${column_list_select}
+FROM ${source_fqn}
+${where_clause}
 ```
 
-> `${column_select_list}` do NiFi build từ `column_mapping` (Doc 12 §6.3):
-> `txn_id, CAST(amount AS DECIMAL(18,2)) AS transaction_amount, UPPER(TRIM(currency)) AS currency_code, ...`
-> Nếu chưa cần transform cột, dùng `SELECT *`.
-> `${last_watermark}` lấy từ `pipeline_execution_log` theo `pipeline_id` silver + `layer='silver'` (Doc 11 §7.3).
+- `${source_fqn}` step đầu = bronze: `"minio-datalake"."bronze"."<source_table>"`.
+- `${where_clause}` (incremental): `WHERE <watermark_column> > TIMESTAMP '${last_watermark}'`; (full): rỗng.
+- `${column_list_select}`: build từ `column_mapping`, có cast/clean (Doc 12 §6.3) — **không `SELECT *`**.
+- `${last_watermark}`: từ `pipeline_execution_log` theo `pipeline_id` silver + `layer='silver'` (Doc 11 §7.3).
 
-### 3.3 Dedup trên Staging (in place)
-
-**Khi dùng:** luôn chạy sau stage-load. Khử trùng lặp **trên staging**, ghi đè lại staging.
+### 3.2 T_DEDUP — temp → temp (generic)
 
 ```sql
--- Template ID: SILVER_STAGE_DEDUP
--- Transform type: dedup  | execution_order: 2
-
-CREATE OR REPLACE TABLE "minio-datalake"."staging"."${target_table}" AS
-SELECT * EXCEPT (_row_num)
+-- Template ID: T_DEDUP
+CREATE TABLE ${stage_out} AS
+SELECT ${column_list}
 FROM (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY ${primary_keys}
-            ORDER BY ${watermark_column} DESC
-        ) AS _row_num
-    FROM "minio-datalake"."staging"."${target_table}"
+    SELECT ${column_list},
+           ROW_NUMBER() OVER (PARTITION BY ${primary_keys} ORDER BY ${order_by_clause}) AS _rn
+    FROM ${stage_in}
 )
-WHERE _row_num = 1
+WHERE _rn = 1
 ```
 
-> Bảng full-load không có watermark → đổi `ORDER BY ${watermark_column} DESC` thành `ORDER BY ${primary_keys}`
-> (giữ 1 bản bất kỳ theo PK). Nếu Dremio không hỗ trợ `* EXCEPT(...)`, liệt kê cột tường minh.
+- `${order_by_clause}`: `<watermark_column> DESC` nếu có watermark, ngược lại `${primary_keys}`.
+- Liệt kê `${column_list}` tường minh ⇒ **không cần `SELECT *` / `EXCEPT`**.
 
-### 3.4 Ensure Target — tạo silver nếu chưa có
-
-**Khi dùng:** trước MERGE, đảm bảo bảng silver tồn tại với schema khớp staging.
+### 3.3 T_ENSURE_TARGET — tạo bảng đích nếu chưa có (generic, chỉ incremental)
 
 ```sql
--- Template ID: SILVER_ENSURE_TABLE
--- Transform type: create_table  | execution_order: 3
-
-CREATE TABLE IF NOT EXISTS "minio-datalake"."silver"."${target_table}" AS
-SELECT * FROM "minio-datalake"."staging"."${target_table}" WHERE 1=0
+-- Template ID: T_ENSURE_TARGET
+CREATE TABLE IF NOT EXISTS ${target_fqn} AS
+SELECT ${column_list} FROM ${stage_in} WHERE 1=0
 ```
 
-### 3.5 Merge — Staging → Silver (Incremental upsert)
+### 3.4 T_MERGE — temp cuối → bảng chính (generic; incremental upsert)
 
-**Khi dùng:** load_type = `incremental`. Upsert từ staging (đã dedup) vào silver.
+Explicit update/insert — **không `SET *` / `INSERT *`**.
 
 ```sql
--- Template ID: SILVER_MERGE
--- Transform type: merge  | execution_order: 4
-
-MERGE INTO "minio-datalake"."silver"."${target_table}" AS target
-USING "minio-datalake"."staging"."${target_table}" AS source
+-- Template ID: T_MERGE
+MERGE INTO ${target_fqn} AS t
+USING ${stage_in} AS s
 ON ${merge_on_clause}
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
+WHEN MATCHED THEN UPDATE SET ${update_set_clause}
+WHEN NOT MATCHED THEN INSERT (${column_list}) VALUES (${insert_values_list})
 ```
 
-> `${merge_on_clause}` do NiFi build từ `primary_keys` (Doc 12 §7.1):
-> `txn_id` → `target.txn_id = source.txn_id`;
-> `txn_id,merchant_id` → `target.txn_id = source.txn_id AND target.merchant_id = source.merchant_id`.
+- `${merge_on_clause}`: `t.txn_id = s.txn_id [AND ...]` (Doc 12 §7.1).
+- `${update_set_clause}`: cột non-PK, vd `transaction_amount = s.transaction_amount, currency_code = s.currency_code, ...`.
+- `${insert_values_list}`: `s.txn_id, s.transaction_amount, ...`.
 
-### 3.6 Full Replace — Staging → Silver (thay cho Merge khi full-load)
+### 3.5 T_FULL_REPLACE — temp cuối → bảng chính (generic; full-load)
 
-**Khi dùng:** load_type = `full` (reference/master data). Thay toàn bộ silver bằng staging đã dedup —
-tự động loại các bản ghi đã bị xóa ở nguồn. Dùng **thay** §3.5 (không cần MERGE).
+Dùng **THAY** §3.3+§3.4 khi `load_type = full`. Tự loại bản ghi đã xóa ở nguồn.
 
 ```sql
--- Template ID: SILVER_FULL_REPLACE
--- Transform type: merge (full)  | execution_order: 4
-
-CREATE OR REPLACE TABLE "minio-datalake"."silver"."${target_table}" AS
-SELECT * FROM "minio-datalake"."staging"."${target_table}"
+-- Template ID: T_FULL_REPLACE
+CREATE OR REPLACE TABLE ${target_fqn} AS
+SELECT ${column_list} FROM ${stage_in}
 ```
 
-> Full-load dùng §3.6 thì **không cần** §3.4 (ENSURE) vì `CREATE OR REPLACE` tự tạo bảng.
+### 3.6 T_CLEANUP — drop toàn bộ temp của run (chạy cuối cùng)
 
-### 3.7 Cleanup — xóa Staging (tùy chọn)
+NiFi biết số step ⇒ sinh danh sách temp và drop từng cái:
 
 ```sql
--- Template ID: SILVER_CLEANUP
--- Transform type: custom  | execution_order: 9
-
-DROP TABLE IF EXISTS "minio-datalake"."staging"."${target_table}"
+-- Template ID: T_CLEANUP   (lặp cho từng temp đã tạo)
+DROP TABLE IF EXISTS ${stage_drop}
 ```
 
-> Tùy chọn vì `SILVER_STAGE_LOAD_*` dùng `CREATE OR REPLACE` nên lần sau tự ghi đè. Drop để tiết kiệm
-> storage / tránh nhầm lẫn khi debug.
+- `${stage_drop}` lần lượt = `..._temp_${run_token}_1`, `..._temp_${run_token}_2`, ...
+- Hoặc liệt kê động: `SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES"
+  WHERE TABLE_NAME LIKE '${target_table}_temp_${run_token}_%'` rồi drop từng cái.
+
+### 3.7 Standard flow = ZERO hardcode, ZERO per-table rule
+
+Với luồng chuẩn **load → dedup → publish** (đa số bảng), bạn **không cần viết `transform_rules`
+riêng cho từng bảng**. NiFi áp **chuỗi template chuẩn** từ thư viện generic, chọn theo
+`pipeline_config.load_type`:
+
+| load_type | Chuỗi template |
+|-----------|----------------|
+| `incremental` | `T_LOAD_STAGE` → `T_DEDUP` → `T_ENSURE_TARGET` → `T_MERGE` → `T_CLEANUP` |
+| `full` | `T_LOAD_STAGE` → `T_DEDUP` → `T_FULL_REPLACE` → `T_CLEANUP` |
+
+→ Onboard 1 bảng thường = INSERT `pipeline_config` + `column_mapping`. `transform_rules` **chỉ** dùng
+cho bước **custom** (filter đặc biệt §3.8, aggregation gold §4). Thư viện template generic lưu 1 lần
+trong bảng `transform_templates` (Doc 10 §3.6).
 
 ### 3.8 Filter (Remove Invalid Records)
 
@@ -617,39 +627,33 @@ VALUES (
 > hiện tại trong cùng INSERT, set 1 cột bằng `CURRENT_TIMESTAMP` và các cột còn lại bằng
 > `CAST('${now():format(...)}' AS TIMESTAMP)`; hoặc INSERT trước rồi `UPDATE` sau.
 
-### 6.3 Build Column List from Mapping
+### 6.3 Build các Column List từ column_mapping (thay cho SELECT *)
 
-NiFi sẽ query column_mapping để build dynamic SELECT clause:
+NiFi query `column_mapping` **một lần** rồi build **tất cả** các biến column-list cần cho template generic:
 
 ```sql
--- Query column_mapping cho 1 pipeline
-SELECT
-    source_column,
-    target_column,
-    data_type,
-    transformation,
-    column_order
+-- Query column_mapping cho 1 stage
+SELECT source_column, target_column, data_type, transformation, is_primary_key, column_order
 FROM "minio-datalake"."metadata".column_mapping
 WHERE pipeline_id = '${pipeline_id}'
 ORDER BY column_order
 ```
 
-NiFi xử lý kết quả để build SELECT clause:
+Từ kết quả, NiFi build các biến (ví dụ cho transactions):
 
-```
--- Nếu transformation IS NULL:
-source_column AS target_column
+| Biến | Quy tắc build | Kết quả |
+|------|---------------|---------|
+| `${column_list_select}` | `transformation` thay `${src}`→source_column, alias `AS target_column`; NULL → `source_column AS target_column` | `txn_id AS txn_id, CAST(amount AS DECIMAL(18,2)) AS transaction_amount, UPPER(TRIM(currency)) AS currency_code, ...` |
+| `${column_list}` | chỉ `target_column` | `txn_id, transaction_amount, currency_code, ...` |
+| `${insert_values_list}` | `s.` + target_column | `s.txn_id, s.transaction_amount, s.currency_code, ...` |
+| `${update_set_clause}` | cột **non-PK**: `target_column = s.target_column` | `transaction_amount = s.transaction_amount, currency_code = s.currency_code, ...` |
 
--- Nếu transformation IS NOT NULL:
-REPLACE(transformation, '${src}', source_column) AS target_column
-
--- Ví dụ kết quả:
--- txn_id AS txn_id,
--- CAST(amount AS DECIMAL(18,2)) AS transaction_amount,
--- UPPER(TRIM(currency)) AS currency_code,
--- merchant_id AS merchant_id,
--- LPAD(bank_code, 9, '0') AS bank_code
-```
+> Dùng `${column_list_select}` ở **T_LOAD_STAGE** (có cast/clean), `${column_list}` ở **T_DEDUP /
+> T_ENSURE_TARGET / T_FULL_REPLACE** (passthrough), `${update_set_clause}`+`${insert_values_list}` ở
+> **T_MERGE**. Không nơi nào dùng `SELECT *`.
+>
+> **NiFi build thế nào:** ExecuteSQL đọc column_mapping → ConvertAvroToJSON → `ExecuteScript`
+> (Groovy/Python) ghép chuỗi → đặt các biến trên thành FlowFile attribute.
 
 ---
 
@@ -695,14 +699,13 @@ PARTITION BY txn_id, merchant_id
 | `BRONZE_FULL_LOAD`         | full         | bronze        | Full load từ source              |
 | `BRONZE_INCREMENTAL_LOAD`  | incremental  | bronze        | Incremental load bằng watermark  |
 | `BRONZE_PARTITION_OVERWRITE`| full        | bronze        | Overwrite 1 partition            |
-| `SILVER_STAGE_LOAD_FULL`   | load_stage   | bronze→staging| Nạp full bronze → staging (cast/clean) |
-| `SILVER_STAGE_LOAD_INCR`   | load_stage   | bronze→staging| Nạp incremental bronze → staging |
-| `SILVER_STAGE_DEDUP`       | dedup        | staging       | Dedup in place trên staging      |
-| `SILVER_ENSURE_TABLE`      | create_table | silver        | Tạo silver nếu chưa có           |
-| `SILVER_MERGE`             | merge        | staging→silver| Incremental upsert từ staging    |
-| `SILVER_FULL_REPLACE`      | merge (full) | staging→silver| Thay toàn bộ silver (full-load)  |
-| `SILVER_CLEANUP`           | custom       | staging       | Drop staging sau khi xong        |
-| `SILVER_FILTER`            | filter       | silver        | Lọc invalid records              |
+| `T_LOAD_STAGE`             | load_stage   | →temp         | Generic: nguồn → temp (full/incr, cast/clean) |
+| `T_DEDUP`                  | dedup        | temp→temp     | Generic: dedup, ghi temp mới     |
+| `T_ENSURE_TARGET`          | create_table | target        | Generic: tạo bảng đích nếu chưa có |
+| `T_MERGE`                  | merge        | temp→target   | Generic: upsert explicit (incremental) |
+| `T_FULL_REPLACE`           | merge (full) | temp→target   | Generic: thay toàn bộ (full-load) |
+| `T_CLEANUP`                | custom       | temp          | Generic: drop toàn bộ temp của run |
+| `SILVER_FILTER`            | filter       | silver        | (custom) Lọc invalid records     |
 | `GOLD_DAILY_SUMMARY`       | aggregate    | gold          | KPI hàng ngày                    |
 | `GOLD_ENTITY_KPIS`         | aggregate    | gold          | KPI theo entity                  |
 | `GOLD_MERCHANT_ANALYTICS`  | aggregate    | gold          | Merchant analytics               |

@@ -464,32 +464,41 @@ WHERE pipeline_id = '${next_pipeline_id}'   -- vd 'SLV_transactions'
 
 **Connection:** `from-router` → `Load Own Config` → ...
 
-### 7.2 Processor: ExecuteSQL (Read Transform Rules)
+### 7.2 Build run_token + column lists, rồi dựng chuỗi step
 
-Khóa theo **pipeline_id của stage này** — lấy đúng rules của silver, không quét toàn bộ:
+**(a) run_token** — UpdateAttribute: `run_token = ${run_id:substring(4,12)}` (8 ký tự, đặt tên temp).
+
+**(b) Build column lists từ column_mapping** — ExecuteSQL đọc `column_mapping WHERE pipeline_id =
+'${pipeline_id}' ORDER BY column_order` → `ExecuteScript` (Groovy) ghép thành các attribute:
+`${column_list}`, `${column_list_select}`, `${update_set_clause}`, `${insert_values_list}` (Doc 12 §6.3).
+→ **không dùng `SELECT *`.**
+
+**(c) Dựng danh sách step** — đa số bảng dùng **chuỗi template chuẩn từ `transform_templates`**
+(generic, reusable), chọn theo `load_type` (Doc 12 §3.7):
 
 ```sql
-SELECT r.rule_id, r.rule_name, r.transform_type, r.sql_template, r.execution_order
-FROM "minio-datalake"."metadata".transform_rules r
-WHERE r.pipeline_id = '${pipeline_id}'   -- = SLV_*
-  AND r.is_active = true
-ORDER BY r.execution_order
+-- Đọc thư viện template generic (1 query, dùng chung mọi bảng)
+SELECT template_id, transform_type, sql_template
+FROM "minio-datalake"."metadata".transform_templates
 ```
 
-→ `ConvertAvroToJSON` (`Rules to JSON`) → `SplitJson` `$[*]` (`Split Per Rule`) →
-`EvaluateJsonPath` (`Extract Rule`: `rule_id`, `rule_name`, `transform_type`, `sql_template`).
+NiFi sắp các template theo chuỗi:
+- `incremental`: `T_LOAD_STAGE → T_DEDUP → T_ENSURE_TARGET → T_MERGE → T_CLEANUP`
+- `full`: `T_LOAD_STAGE → T_DEDUP → T_FULL_REPLACE → T_CLEANUP`
 
-> SplitJson giữ nguyên attribute cha (`run_id`, `pipeline_id`, `target_table`...) cho mỗi rule.
+Bước **custom** (gold aggregation, filter) lấy thêm từ `transform_rules WHERE pipeline_id =
+'${pipeline_id}'` và chèn theo `execution_order`.
+
+**(d) Gán temp cho từng step** — với step thứ `i`:
+`stage_out = "minio-datalake"."staging"."${target_table}_temp_${run_token}_${i}"`,
+`stage_in` = `stage_out` của step `i-1` (step 1: `stage_in = ${source_fqn}` = bronze). `T_CLEANUP`
+lặp drop mọi `..._temp_${run_token}_*`.
+
+> ⚠️ **BẮT BUỘC chạy tuần tự đúng thứ tự** (mỗi step đọc temp của step trước):
+> - `Render Transform SQL` + `Run Transform on Dremio`: **Concurrent Tasks = 1**.
+> - Connection sau bước split: prioritizer **FirstInFirstOutPrioritizer**.
 >
-> ⚠️ **BẮT BUỘC chạy tuần tự đúng `execution_order`.** Silver dùng **pattern staging**:
-> `load_stage` (bronze→staging) → `dedup` (trên staging) → `create_table` (ensure silver) →
-> `merge` (staging→silver). Các bước phụ thuộc nhau nên KHÔNG được chạy song song/đảo thứ tự.
-> Cấu hình để đảm bảo:
-> - `Render Transform SQL` và `Run Transform on Dremio`: **Concurrent Tasks = 1**.
-> - Connection sau `Split Per Rule`: dùng prioritizer **FirstInFirstOutPrioritizer**.
-> - SplitJson phát fragment theo đúng thứ tự kết quả (đã `ORDER BY execution_order`).
->
-> Xem SQL từng bước ở [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3 (Staging Pattern).
+> SQL từng template: [12-dynamic-sql-templates.md](12-dynamic-sql-templates.md) §3.
 
 ### 7.3 Incremental: Get Silver Watermark (nếu load_type = incremental)
 
@@ -515,13 +524,14 @@ WHERE pipeline_id = '${pipeline_id}'   -- SLV_*
 | **Replacement Strategy** | `Regex Replace` |
 | **Evaluation Mode** | `Entire text` |
 
-> `${sql_template}` chứa SQL trong metadata; các biến `${source_table}`, `${target_table}`,
-> `${primary_keys}`, `${watermark_column}`, `${last_watermark}`, `${column_select_list}`,
-> `${merge_on_clause}` được Expression Language resolve vì chúng đều là attribute (từ Load Own
-> Config + Get Silver Watermark + build từ column_mapping/primary_keys). Chi tiết template: Doc 12 §3.
+> `${sql_template}` là template **generic** (từ `transform_templates`); các biến `${stage_in}`,
+> `${stage_out}`, `${source_fqn}`, `${target_fqn}`, `${column_list}`, `${column_list_select}`,
+> `${merge_on_clause}`, `${update_set_clause}`, `${insert_values_list}`, `${where_clause}`,
+> `${order_by_clause}`, `${last_watermark}` đều đã là attribute (từ §7.2 + §7.3) nên Expression
+> Language resolve hết. Chi tiết template: Doc 12 §3.
 >
-> Template ghi vào **staging** trước, chỉ bước `merge` mới chạm bảng silver chính → silver không
-> bao giờ ở trạng thái dang dở. (Tùy chọn) thêm rule `SILVER_CLEANUP` cuối cùng để drop staging.
+> Mỗi step ghi ra **temp riêng** (`${stage_out}`); chỉ bước publish cuối (`T_MERGE`/`T_FULL_REPLACE`)
+> mới chạm bảng chính → silver không bao giờ dang dở. Bước cuối `T_CLEANUP` drop toàn bộ temp của run.
 
 ### 7.5 Processor: ExecuteSQL (Run Transform on Dremio)
 
