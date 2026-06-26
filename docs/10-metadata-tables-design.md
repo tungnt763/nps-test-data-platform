@@ -371,22 +371,22 @@ INSERT INTO "minio-datalake"."metadata".transform_templates
 VALUES
 ('T_LOAD_STAGE','load_stage',
  'CREATE TABLE ${stage_out} AS SELECT ${column_list_select} FROM ${source_fqn} ${where_clause}',
- 'Nguồn → temp (full/incr + cast/clean)'),
+ 'Source to temp (full or incremental, with cast and clean)'),
 ('T_DEDUP','dedup',
  'CREATE TABLE ${stage_out} AS SELECT ${column_list} FROM (SELECT ${column_list}, ROW_NUMBER() OVER (PARTITION BY ${primary_keys} ORDER BY ${order_by_clause}) AS _rn FROM ${stage_in}) WHERE _rn = 1',
- 'Dedup temp → temp mới'),
+ 'Dedup temp into a new temp'),
 ('T_ENSURE_TARGET','create_table',
  'CREATE TABLE IF NOT EXISTS ${target_fqn} AS SELECT ${column_list} FROM ${stage_in} WHERE 1=0',
- 'Tạo bảng đích nếu chưa có'),
+ 'Create target table if not exists'),
 ('T_MERGE','merge',
  'MERGE INTO ${target_fqn} AS t USING ${stage_in} AS s ON ${merge_on_clause} WHEN MATCHED THEN UPDATE SET ${update_set_clause} WHEN NOT MATCHED THEN INSERT (${column_list}) VALUES (${insert_values_list})',
- 'Upsert temp → bảng chính (incremental)'),
+ 'Upsert temp into main table (incremental)'),
 ('T_FULL_REPLACE','merge',
  'CREATE OR REPLACE TABLE ${target_fqn} AS SELECT ${column_list} FROM ${stage_in}',
- 'Thay toàn bộ bảng chính (full-load)'),
+ 'Replace whole main table (full load)'),
 ('T_CLEANUP','custom',
  'DROP TABLE IF EXISTS ${stage_drop}',
- 'Drop 1 temp (lặp cho mọi temp của run)');
+ 'Drop one temp (repeat for each temp of the run)');
 ```
 
 > **Lưu ý reusability:** không có dòng nào nhắc tên bảng/cột cụ thể. Onboard bảng mới = thêm
@@ -416,7 +416,7 @@ VALUES
 -- ===== ROOT STAGES: source → bronze (depends_on = NULL, được Controller trigger) =====
 ('BRZ_transactions','bronze_transactions','transactions','jdbc','source-postgres-pool','public',
  'transactions','source','bronze','transactions','incremental','txn_id','created_at','transaction_date',
- NULL, 10000,'0 2 * * *', true,'Incremental ingest transactions từ source'),
+ NULL, 10000,'0 2 * * *', true,'Incremental ingest transactions from source'),
 
 ('BRZ_merchants','bronze_merchants','merchants','jdbc','source-postgres-pool','public',
  'merchants','source','bronze','merchants','full','merchant_id',NULL,NULL,
@@ -433,19 +433,19 @@ VALUES
 -- ===== SILVER STAGES: bronze → silver (config ĐỘC LẬP với bronze; depends_on = BRZ_*) =====
 ('SLV_transactions','silver_transactions','transactions','internal',NULL,NULL,
  'transactions','bronze','silver','transactions','incremental','txn_id','created_at',NULL,
- 'BRZ_transactions', NULL,NULL, true,'Dedup + merge transactions bronze→silver'),
+ 'BRZ_transactions', NULL,NULL, true,'Dedup and merge transactions bronze to silver'),
 
 ('SLV_merchants','silver_merchants','merchants','internal',NULL,NULL,
  'merchants','bronze','silver','merchants','full','merchant_id',NULL,NULL,
- 'BRZ_merchants', NULL,NULL, true,'Dedup merchants bronze→silver'),
+ 'BRZ_merchants', NULL,NULL, true,'Dedup merchants bronze to silver'),
 
 ('SLV_bank_codes','silver_bank_codes','bank_codes','internal',NULL,NULL,
  'bank_codes','bronze','silver','bank_codes','full','bank_code',NULL,NULL,
- 'BRZ_bank_codes', NULL,NULL, true,'Dedup bank_codes bronze→silver'),
+ 'BRZ_bank_codes', NULL,NULL, true,'Dedup bank_codes bronze to silver'),
 
 ('SLV_settlements','silver_settlements','settlements','internal',NULL,NULL,
  'settlements','bronze','silver','settlements','incremental','settlement_id','settlement_date',NULL,
- 'BRZ_settlements', NULL,NULL, true,'Merge settlements bronze→silver'),
+ 'BRZ_settlements', NULL,NULL, true,'Merge settlements bronze to silver'),
 
 -- ===== GOLD STAGES: silver → gold (depends_on = SLV_*; GLD_bank_kpis là fan-in 2 parent) =====
 ('GLD_daily_txn','gold_daily_txn_summary','transactions','internal',NULL,NULL,
